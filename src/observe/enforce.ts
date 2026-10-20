@@ -1,4 +1,5 @@
 import { ObserveClient } from './client.js';
+import type { ObservedCall } from './protocol.js';
 import { goJSON, jsonObject } from './protocol.js';
 import type { JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from './types.js';
 
@@ -28,6 +29,9 @@ export class EnforceOutcomeUnknownError extends Error {
 /** Runs only explicitly allowed calls and withholds results that fail their check. */
 export class EnforceClient {
   readonly #sidecar: ObserveClient;
+  readonly #pending = new WeakMap<EnforceBlockedError,
+    { call: ObservedCall; decision: ObserveDecision;
+      execute: (checkedArguments: JSONObject) => JSONObject | Promise<JSONObject> }>();
 
   constructor(config: ObserveClientConfig) {
     this.#sidecar = new ObserveClient(config);
@@ -46,9 +50,40 @@ export class EnforceClient {
     try { callDecision = await this.#sidecar.evaluate(call, 'tool_call', 'enforce'); }
     catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
     if (!permitted(callDecision)) {
-      throw new EnforceBlockedError('tool_call', false, callDecision);
+      const blocked = new EnforceBlockedError('tool_call', false, callDecision);
+      if (callDecision.outcome === 'approval_required' &&
+        callDecision.recordingStatus === 'retained' &&
+        callDecision.reportReplayed === false && callDecision.approvalRequestId) {
+        this.#pending.set(blocked, { call, decision: callDecision, execute });
+      }
+      throw blocked;
     }
 
+    const { result, resultDecision } = await this.#execute(call, execute);
+    return { result, callDecision, resultDecision };
+  }
+
+  /** Resumes the original protected function only after a one-use permit claim. */
+  async resumeApproval(
+    blocked: EnforceBlockedError,
+  ): Promise<{ result: JSONObject; permitId: string; resultDecision: ObserveDecision }> {
+    const pending = this.#pending.get(blocked);
+    if (!pending) {
+      throw new EnforceBlockedError('tool_call', false, blocked.decision);
+    }
+    this.#pending.delete(blocked);
+    let permit: { permitId: string; actionId: string; expiresAt: string };
+    try { permit = await this.#sidecar.claimApproval(pending.call, pending.decision); }
+    catch (cause) { throw new EnforceBlockedError('tool_call', false, pending.decision, cause); }
+    if (Date.parse(permit.expiresAt) <= Date.now()) {
+      throw new EnforceBlockedError('tool_call', false, pending.decision);
+    }
+    const { result, resultDecision } = await this.#execute(pending.call, pending.execute);
+    return { result, permitId: permit.permitId, resultDecision };
+  }
+
+  async #execute<Result extends JSONObject>(call: ObservedCall,
+    execute: (checkedArguments: JSONObject) => Result | Promise<Result>) {
     // Only the protected application receives this callback and provider credentials.
     // The SDK cannot prove that a separate agent path cannot reach the same effect.
     let result: Result;
@@ -65,7 +100,7 @@ export class EnforceClient {
     try { resultDecision = await this.#sidecar.evaluate(call, 'tool_result', 'enforce', result); }
     catch (cause) { throw new EnforceBlockedError('tool_result', true, null, cause); }
     if (!permitted(resultDecision)) throw new EnforceBlockedError('tool_result', true, resultDecision);
-    return { result, callDecision, resultDecision };
+    return { result, resultDecision };
   }
 }
 

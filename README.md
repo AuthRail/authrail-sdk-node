@@ -154,6 +154,22 @@ already run. A function error raises `EnforceOutcomeUnknownError`: reconcile
 the external effect before retrying with the same stable action key. The SDK
 does not automatically retry a business effect.
 
+When a retained decision requires approval, catch its `EnforceBlockedError`
+and keep that error with the pending workflow. Its `decision.approvalRequestId`
+identifies the review request. An approval-capable Enforce call must include
+`operation.reviewSummary`, for example `{ title: "Pay invoice", fields:
+[{ label: "Amount", value: "400 USD" }] }`. Supply only the few facts a human
+needs to decide. Never put raw tool payloads, credentials, or sensitive content
+there. The protected application signs the summary digest; AuthRail lists it
+only for named reviewers in Rails → Approvals for you. Without a valid summary,
+approval remains unavailable. After a named reviewer approves, call
+`authrail.resumeApproval(blockedError)` on the **same** client instance. It
+claims the original Action once through the sidecar, runs the original protected
+callback, and checks the result before exposure. A lost or rejected claim does
+not run the callback and cannot be retried through the same error. Reconcile the
+Action before taking another step. Process loss also requires reconciliation;
+the SDK does not persist the pending callback or claim state.
+
 If the signed Enforce bundle expires or becomes unavailable, protected calls
 stop. A tenant manager can switch the deployment back to Observe, renew the
 exact published Rails, recheck call and result coverage, and turn on Enforce
@@ -162,8 +178,8 @@ again.
 Keep the function and provider credentials unreachable from the agent through
 other tools, network paths, or secret access. A sidecar decision and a saved
 certificate do not independently prove that the callback ran or that no
-bypass exists. Approval permits and authenticated execution receipts remain
-separate capabilities.
+bypass exists. The approval permit records permission, not execution.
+Authenticated execution receipts remain a separate capability.
 
 ## Work on this SDK
 

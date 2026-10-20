@@ -43,6 +43,12 @@ export type TrajectorySnapshot = {
   values?: JSONObject;
 };
 
+/** Small, application-supplied context for named human reviewers. Never include secrets. */
+export type ReviewSummary = {
+  title: string;
+  fields: Array<{ label: string; value: string }>;
+};
+
 /** Identifies one reviewed action and the application's authenticated caller and target. */
 export type ObserveOperation = {
   operationVersionId: string;
@@ -54,6 +60,7 @@ export type ObserveOperation = {
   resourceSource: 'application_lookup' | 'not_applicable';
   factResolutions?: FactResolution[];
   trajectory?: TrajectorySnapshot;
+  reviewSummary?: ReviewSummary;
 };
 
 /** Advisory local decision; recording status is separate from evaluation coverage. */
@@ -66,6 +73,7 @@ export type ObserveDecision = {
   recordingStatus?: 'retained' | 'queued' | 'unavailable';
   reportReplayed?: boolean;
   actionId?: string;
+  approvalRequestId?: string;
   certificateId?: string;
   [key: string]: unknown;
 };

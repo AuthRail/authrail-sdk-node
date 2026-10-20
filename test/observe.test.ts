@@ -10,6 +10,7 @@ type RequestBody = {
   phase: 'tool_call' | 'tool_result';
   attribution: Record<string, unknown>;
   identityProof: { issuedAt: number; expiresAt: number; signature: string };
+  reviewSummary?: { title: string; fields: Array<{ label: string; value: string }> };
 };
 
 function requestBody(init: RequestInit | undefined): RequestBody {
@@ -70,6 +71,33 @@ test('Enforce runs only after a retained allow and checks the result before expo
   assert.deepEqual(completed.result, { status: 'paid' });
 });
 
+test('Enforce signs the bounded human summary only on the call', async () => {
+  let checked = 0;
+  const adapter = enforceClient(async (_url, init) => {
+    const body = requestBody(init);
+    if (body.phase === 'tool_call') {
+      assert.equal(body.reviewSummary?.title, 'Pay invoice');
+      const digest = createHash('sha256').update(JSON.stringify({ title: body.reviewSummary?.title,
+        fields: body.reviewSummary?.fields.map(({ label, value }) => ({ label, value })) })).digest('hex');
+      const statement = JSON.stringify({ type: 'authrail.observe.executor.v1',
+        organisationId, deploymentId, requestId: body.requestId,
+        actionKey: 'invoice-123', operationVersionId, phase: 'tool_call',
+        inputSha256: createHash('sha256').update('{"arguments":{"amount":400}}').digest('hex'),
+        attribution: body.attribution, reviewSummarySha256: digest,
+        issuedAt: body.identityProof.issuedAt, expiresAt: body.identityProof.expiresAt });
+      assert.equal(verify(null, Buffer.from(statement), keys.publicKey,
+        Buffer.from(body.identityProof.signature, 'base64url')), true);
+    } else assert.equal(body.reviewSummary, undefined);
+    checked++;
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow',
+      recordingStatus: 'retained', reportReplayed: false }), { status: 200 });
+  });
+  await adapter.enforce({ ...operation(), reviewSummary: { title: 'Pay invoice',
+    fields: [{ label: 'Amount', value: '400' }] } }, { amount: 400 }, () => ({ paid: true }));
+  assert.equal(checked, 2);
+});
+
 test('Enforce stops denied or unrecorded calls and withholds denied results', async () => {
   let outcome = 'deny';
   let recordingStatus = 'retained';
@@ -113,6 +141,17 @@ test('Enforce stops denied or unrecorded calls and withholds denied results', as
   assert.equal(effects, 1);
 });
 
+test('Enforce does not run the protected call while the sidecar is offline', async () => {
+  const adapter = enforceClient(async () => { throw new Error('sidecar offline'); });
+  let effects = 0;
+  await assert.rejects(adapter.enforce(operation(), {}, () => {
+    effects++;
+    return { paid: true };
+  }), (error) => error instanceof EnforceBlockedError &&
+    error.phase === 'tool_call' && !error.effectMayHaveOccurred);
+  assert.equal(effects, 0);
+});
+
 test('Enforce preserves an uncertain tool outcome for reconciliation', async () => {
   const adapter = enforceClient(async (_url, init) => {
     const body = requestBody(init);
@@ -123,6 +162,79 @@ test('Enforce preserves an uncertain tool outcome for reconciliation', async () 
   await assert.rejects(adapter.enforce(operation(), {}, () => {
     throw new Error('provider timed out');
   }), EnforceOutcomeUnknownError);
+});
+
+test('approval resumes the original call only after a one-use claim', async () => {
+  const actionId = randomUUID();
+  const approvalRequestId = randomUUID();
+  const permitId = randomUUID();
+  const requests: string[] = [];
+  const adapter = enforceClient(async (url, init) => {
+    const path = new URL(String(url)).pathname;
+    requests.push(path);
+    if (path === '/approval-permits/claim') {
+      const claim = JSON.parse(String(init?.body)) as { actionId: string;
+        approvalRequestId: string; proof: { signature: string; issuedAt: number;
+          expiresAt: number }; inputSha256: string; keySha256: string };
+      assert.equal(claim.actionId, actionId);
+      assert.equal(claim.approvalRequestId, approvalRequestId);
+      const statement = JSON.stringify({ type: 'authrail.approval.claim.v1',
+        organisationId, deploymentId, approvalRequestId, actionId,
+        inputSha256: claim.inputSha256, keySha256: claim.keySha256,
+        issuedAt: claim.proof.issuedAt, expiresAt: claim.proof.expiresAt });
+      assert.equal(verify(null, Buffer.from(statement), keys.publicKey,
+        Buffer.from(claim.proof.signature, 'base64url')), true);
+      return new Response(JSON.stringify({ permitId, actionId,
+        expiresAt: new Date(Date.now() + 20_000).toISOString() }), { status: 201 });
+    }
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: body.phase === 'tool_call'
+        ? 'approval_required' : 'allow', recordingStatus: 'retained', reportReplayed: false,
+      ...(body.phase === 'tool_call' ? { actionId, approvalRequestId } : {}) }),
+    { status: 200 });
+  });
+  let blocked: EnforceBlockedError | undefined;
+  let effects = 0;
+  try { await adapter.enforce(operation(), { amount: 400 }, () => {
+    effects++;
+    return { paid: true };
+  }); } catch (error) {
+    if (error instanceof EnforceBlockedError) blocked = error;
+    else throw error;
+  }
+  assert.ok(blocked);
+  assert.equal(effects, 0);
+  const resumed = await adapter.resumeApproval(blocked);
+  assert.equal(resumed.permitId, permitId);
+  assert.equal(effects, 1);
+  assert.deepEqual(requests, ['/evaluate', '/approval-permits/claim', '/evaluate']);
+  await assert.rejects(adapter.resumeApproval(blocked), EnforceBlockedError);
+  assert.equal(effects, 1);
+});
+
+test('an uncertain approval claim never runs or retries the protected callback', async () => {
+  let claims = 0;
+  const adapter = enforceClient(async (url, init) => {
+    if (new URL(String(url)).pathname === '/approval-permits/claim') {
+      claims++;
+      throw new Error('response lost');
+    }
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'approval_required',
+      recordingStatus: 'retained', reportReplayed: false,
+      actionId: randomUUID(), approvalRequestId: randomUUID() }), { status: 200 });
+  });
+  let blocked: EnforceBlockedError | undefined;
+  let effects = 0;
+  try { await adapter.enforce(operation(), {}, () => { effects++; return {}; }); }
+  catch (error) { if (error instanceof EnforceBlockedError) blocked = error; else throw error; }
+  assert.ok(blocked);
+  await assert.rejects(adapter.resumeApproval(blocked), EnforceBlockedError);
+  await assert.rejects(adapter.resumeApproval(blocked), EnforceBlockedError);
+  assert.equal(claims, 1);
+  assert.equal(effects, 0);
 });
 
 function expectedStatement(body: RequestBody, inputSha256: string) {

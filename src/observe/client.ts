@@ -1,4 +1,4 @@
-import { createHash, createPrivateKey, KeyObject, randomUUID, sign } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, KeyObject, randomUUID, sign } from 'node:crypto';
 import type { ObservedCall, Phase } from './protocol.js';
 import {
   boundedJSON,
@@ -158,6 +158,7 @@ export class ObserveClient {
       ...(operation.factResolutions !== undefined
         ? { factResolutions: operation.factResolutions } : {}),
       ...(operation.trajectory !== undefined ? { trajectory: operation.trajectory } : {}),
+      ...(operation.reviewSummary !== undefined ? { reviewSummary: operation.reviewSummary } : {}),
       arguments: argumentsValue,
     });
     if (!uuid.test(snapshot.operationVersionId) || !reference.test(snapshot.actionKey) ||
@@ -168,6 +169,9 @@ export class ObserveClient {
       !['application_session', 'service_identity'].includes(snapshot.principalSource) ||
       !['application_lookup', 'not_applicable'].includes(snapshot.resourceSource)) {
       throw new Error('Action contract is invalid');
+    }
+    if (snapshot.reviewSummary !== undefined && !validReviewSummary(snapshot.reviewSummary)) {
+      throw new Error('Review summary is invalid');
     }
     return { ...snapshot, requestId: randomUUID() };
   }
@@ -187,6 +191,13 @@ export class ObserveClient {
       .digest('hex');
     const issuedAt = Math.floor(Date.now() / 1000);
     const expiresAt = issuedAt + 30;
+    if (call.reviewSummary && expectedMode !== 'enforce') {
+      throw new Error('Review summary is only valid for an Enforce call');
+    }
+    const reviewSummarySha256 = call.reviewSummary && phase === 'tool_call' ? createHash('sha256')
+      .update(JSON.stringify({ title: call.reviewSummary.title,
+        fields: call.reviewSummary.fields.map(({ label, value }) => ({ label, value })) }))
+      .digest('hex') : undefined;
     const statement = fields([
       ['type', goJSON('authrail.observe.executor.v1')],
       ['organisationId', goJSON(this.#organisationId)],
@@ -197,6 +208,7 @@ export class ObserveClient {
       ['phase', goJSON(phase)],
       ['inputSha256', goJSON(inputSha256)],
       ['attribution', encodeAttribution(attribution)],
+      ...(reviewSummarySha256 ? [['reviewSummarySha256', goJSON(reviewSummarySha256)] as [string, string]] : []),
       ['issuedAt', goJSON(issuedAt)],
       ['expiresAt', goJSON(expiresAt)],
     ]);
@@ -211,6 +223,7 @@ export class ObserveClient {
       ...(call.factResolutions?.length ? { factResolutions: call.factResolutions } : {}),
       ...(call.trajectory ? { trajectory: call.trajectory } : {}),
       attribution,
+      ...(reviewSummarySha256 ? { reviewSummary: call.reviewSummary } : {}),
       identityProof: { issuedAt, expiresAt, signature },
     };
     const response = await this.#fetch(this.#endpoint, {
@@ -248,4 +261,65 @@ export class ObserveClient {
     }
     return decision as ObserveDecision;
   }
+
+  /** Claims an approved Action once. An uncertain response must be reconciled, never retried blindly. */
+  async claimApproval(call: ObservedCall, decision: ObserveDecision): Promise<{
+    permitId: string; actionId: string; expiresAt: string }> {
+    if (decision.mode !== 'enforce' || decision.outcome !== 'approval_required' ||
+      decision.recordingStatus !== 'retained' || decision.reportReplayed !== false ||
+      !decision.actionId || !uuid.test(decision.actionId) ||
+      !decision.approvalRequestId || !uuid.test(decision.approvalRequestId)) {
+      throw new Error('A retained approval request is required');
+    }
+    const inputSha256 = createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex');
+    const publicKey = createPublicKey(this.#privateKey).export({ format: 'jwk' });
+    if (typeof publicKey.x !== 'string') throw new Error('Executor key is invalid');
+    const keySha256 = createHash('sha256').update(Buffer.from(publicKey.x, 'base64url')).digest('hex');
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const expiresAt = issuedAt + 30;
+    const statement = fields([
+      ['type', goJSON('authrail.approval.claim.v1')],
+      ['organisationId', goJSON(this.#organisationId)],
+      ['deploymentId', goJSON(this.#deploymentId)],
+      ['approvalRequestId', goJSON(decision.approvalRequestId)],
+      ['actionId', goJSON(decision.actionId)],
+      ['inputSha256', goJSON(inputSha256)],
+      ['keySha256', goJSON(keySha256)],
+      ['issuedAt', goJSON(issuedAt)],
+      ['expiresAt', goJSON(expiresAt)],
+    ]);
+    const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
+    const response = await this.#fetch(new URL('/approval-permits/claim', this.#endpoint), {
+      method: 'POST', redirect: 'manual',
+      headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approvalRequestId: decision.approvalRequestId,
+        actionId: decision.actionId, inputSha256, keySha256,
+        proof: { issuedAt, expiresAt, signature } }),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (response.status !== 201) throw new Error(`Approval claim returned HTTP ${response.status}`);
+    const permit = await boundedJSON(response);
+    if (!permit || typeof permit !== 'object' || Array.isArray(permit) ||
+      !('permitId' in permit) || typeof permit.permitId !== 'string' ||
+      !uuid.test(permit.permitId) || !('actionId' in permit) ||
+      permit.actionId !== decision.actionId || !('expiresAt' in permit) ||
+      typeof permit.expiresAt !== 'string' ||
+      !Number.isFinite(Date.parse(permit.expiresAt)) ||
+      Date.parse(permit.expiresAt) <= Date.now()) {
+      throw new Error('Approval permit response is invalid');
+    }
+    return permit as { permitId: string; actionId: string; expiresAt: string };
+  }
+}
+
+function validReviewSummary(value: unknown): boolean {
+  const safe = (text: unknown, max: number) => typeof text === 'string' &&
+    text.length > 0 && Buffer.byteLength(text) <= max && text.trim() === text &&
+    !/[\u0000-\u001f\u007f<>&\u2028\u2029]/.test(text);
+  if (!jsonObject(value) || Object.keys(value).sort().join(',') !== 'fields,title' ||
+    !safe(value.title, 120) || !Array.isArray(value.fields) ||
+    value.fields.length < 1 || value.fields.length > 8) return false;
+  return value.fields.every((field) => jsonObject(field) &&
+    Object.keys(field).sort().join(',') === 'label,value' &&
+    safe(field.label, 60) && safe(field.value, 200));
 }
