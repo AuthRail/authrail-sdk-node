@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, randomUUID, verify } from 'node:crypto';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
-import { ObserveClient } from '../src/index.js';
+import { EnforceBlockedError, EnforceClient, EnforceOutcomeUnknownError, ObserveClient } from '../src/index.js';
 import type { ObserveOperation } from '../src/index.js';
 
 type RequestBody = {
@@ -44,6 +44,86 @@ function client(fetchImpl: typeof fetch) {
     fetch: fetchImpl,
   });
 }
+
+function enforceClient(fetchImpl: typeof fetch) {
+  return new EnforceClient({ sidecarUrl: 'http://127.0.0.1:7078', adapterToken,
+    organisationId, deploymentId, executorPrivateKey: keys.privateKey, fetch: fetchImpl });
+}
+
+test('Enforce runs only after a retained allow and checks the result before exposure', async () => {
+  const phases: string[] = [];
+  const adapter = enforceClient(async (_url, init) => {
+    const body = requestBody(init);
+    phases.push(body.phase);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow',
+      recordingStatus: 'retained', reportReplayed: false }),
+      { status: 200 });
+  });
+  let effects = 0;
+  const completed = await adapter.enforce(operation(), { invoiceId: 'invoice_123' }, () => {
+    effects++;
+    return { status: 'paid' };
+  });
+  assert.equal(effects, 1);
+  assert.deepEqual(phases, ['tool_call', 'tool_result']);
+  assert.deepEqual(completed.result, { status: 'paid' });
+});
+
+test('Enforce stops denied or unrecorded calls and withholds denied results', async () => {
+  let outcome = 'deny';
+  let recordingStatus = 'retained';
+  const adapter = enforceClient(async (_url, init) => {
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome, recordingStatus,
+      reportReplayed: false }), { status: 200 });
+  });
+  let effects = 0;
+  const effect = () => { effects++; return { secret: 'private' }; };
+  await assert.rejects(adapter.enforce(operation(), {}, effect), (error) =>
+    error instanceof EnforceBlockedError && error.phase === 'tool_call' &&
+    !error.effectMayHaveOccurred);
+  assert.equal(effects, 0);
+  outcome = 'allow';
+  recordingStatus = 'queued';
+  await assert.rejects(adapter.enforce(operation(), {}, effect), EnforceBlockedError);
+  assert.equal(effects, 0);
+  recordingStatus = 'retained';
+  const replayed = enforceClient(async (_url, init) => {
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow',
+      recordingStatus: 'retained', reportReplayed: true }), { status: 200 });
+  });
+  await assert.rejects(replayed.enforce(operation(), {}, effect), EnforceBlockedError);
+  assert.equal(effects, 0);
+  let checks = 0;
+  const resultAdapter = enforceClient(async (_url, init) => {
+    const body = requestBody(init);
+    checks++;
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated',
+      outcome: checks === 1 ? 'allow' : 'deny', recordingStatus: 'retained',
+      reportReplayed: false }), { status: 200 });
+  });
+  await assert.rejects(resultAdapter.enforce(operation(), {}, effect), (error) =>
+    error instanceof EnforceBlockedError && error.phase === 'tool_result' &&
+    error.effectMayHaveOccurred);
+  assert.equal(effects, 1);
+});
+
+test('Enforce preserves an uncertain tool outcome for reconciliation', async () => {
+  const adapter = enforceClient(async (_url, init) => {
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow',
+      recordingStatus: 'retained', reportReplayed: false }), { status: 200 });
+  });
+  await assert.rejects(adapter.enforce(operation(), {}, () => {
+    throw new Error('provider timed out');
+  }), EnforceOutcomeUnknownError);
+});
 
 function expectedStatement(body: RequestBody, inputSha256: string) {
   return JSON.stringify({

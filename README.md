@@ -128,9 +128,42 @@ data, run a model, judge a Rail, or turn an untrusted claim into an authenticate
 fact. Keep provider credentials behind the protected executor and outside the
 agent. If an agent can bypass that executor, the deployment is advisory.
 
-Enforce-mode blocking, approvals, execution receipts, and independent
-interception proof are outside this Observe client. Do not use it as an
-Enforce adapter.
+## Protect a tool with Enforce
+
+After reviewing the deployment's connection and bypass paths, use
+`EnforceClient` inside the application that holds the provider credentials:
+
+```ts
+import { EnforceClient } from "@authrail/sdk-node";
+
+const authrail = new EnforceClient(config);
+const checked = await authrail.enforce(operation, { invoiceId: invoice.id },
+  (checkedArguments) => invoiceService.read(checkedArguments.invoiceId));
+return checked.result;
+```
+
+The callback runs only after a covered `allow` decision has been retained by
+AuthRail. The SDK checks a successful result before returning it to the agent.
+It stops on denial, missing coverage, approval required, sidecar failure, or a
+report that has only been queued. An already retained call with the same action
+key also stops so a retry cannot silently run the effect again before execution
+receipts are available. Investigate that Action before creating a new business
+attempt. `EnforceBlockedError` identifies the phase; `effectMayHaveOccurred`
+is true for a blocked result because the function has
+already run. A function error raises `EnforceOutcomeUnknownError`: reconcile
+the external effect before retrying with the same stable action key. The SDK
+does not automatically retry a business effect.
+
+If the signed Enforce bundle expires or becomes unavailable, protected calls
+stop. A tenant manager can switch the deployment back to Observe, renew the
+exact published Rails, recheck call and result coverage, and turn on Enforce
+again.
+
+Keep the function and provider credentials unreachable from the agent through
+other tools, network paths, or secret access. A sidecar decision and a saved
+certificate do not independently prove that the callback ran or that no
+bypass exists. Approval permits and authenticated execution receipts remain
+separate capabilities.
 
 ## Work on this SDK
 

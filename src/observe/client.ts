@@ -81,37 +81,8 @@ export class ObserveClient {
     let call: ObservedCall | undefined;
     let callCheck: Promise<Checked>;
     try {
-      const snapshot = freezeContext({
-        operationVersionId: operation.operationVersionId,
-        actionKey: operation.actionKey,
-        principalId: operation.principalId,
-        sessionId: operation.sessionId,
-        principalSource: operation.principalSource,
-        resourceSource: operation.resourceSource,
-        ...(operation.resourceId !== undefined ? { resourceId: operation.resourceId } : {}),
-        ...(operation.factResolutions !== undefined
-          ? { factResolutions: operation.factResolutions }
-          : {}),
-        ...(operation.trajectory !== undefined ? { trajectory: operation.trajectory } : {}),
-        arguments: argumentsValue,
-      });
-      if (
-        !uuid.test(snapshot.operationVersionId) ||
-        !reference.test(snapshot.actionKey) ||
-        !reference.test(snapshot.principalId) ||
-        !reference.test(snapshot.sessionId) ||
-        (snapshot.resourceId !== undefined &&
-          snapshot.resourceId !== null &&
-          !reference.test(snapshot.resourceId)) ||
-        !jsonObject(snapshot.arguments) ||
-        Buffer.byteLength(goJSON(snapshot.arguments)) > 64 * 1024 ||
-        !['application_session', 'service_identity'].includes(snapshot.principalSource) ||
-        !['application_lookup', 'not_applicable'].includes(snapshot.resourceSource)
-      ) {
-        throw new Error('Observe call contract is invalid');
-      }
-      call = { ...snapshot, requestId: randomUUID() };
-      callCheck = this.#evaluate(call, 'tool_call').then(
+      call = this.prepare(operation, argumentsValue);
+      callCheck = this.evaluate(call, 'tool_call', 'observe').then(
         (decision) => ({ decision, error: null }),
         (error) => ({ decision: null, error }),
       );
@@ -145,7 +116,7 @@ export class ObserveClient {
           };
         }
         try {
-          const resultDecision = await this.#evaluate(call, 'tool_result', value);
+          const resultDecision = await this.evaluate(call, 'tool_result', 'observe', value);
           return {
             callDecision: checkedCall.decision,
             callError: checkedCall.error,
@@ -174,8 +145,36 @@ export class ObserveClient {
     return { result, observation };
   }
 
-  /** Signs the exact canonical input and authenticated application claims for this phase. */
-  async #evaluate(call: ObservedCall, phase: Phase, result?: unknown): Promise<ObserveDecision> {
+  /** Prepare one immutable action before a protected call; reused for the result phase. */
+  prepare(operation: ObserveOperation, argumentsValue: JSONObject): ObservedCall {
+    const snapshot = freezeContext({
+      operationVersionId: operation.operationVersionId,
+      actionKey: operation.actionKey,
+      principalId: operation.principalId,
+      sessionId: operation.sessionId,
+      principalSource: operation.principalSource,
+      resourceSource: operation.resourceSource,
+      ...(operation.resourceId !== undefined ? { resourceId: operation.resourceId } : {}),
+      ...(operation.factResolutions !== undefined
+        ? { factResolutions: operation.factResolutions } : {}),
+      ...(operation.trajectory !== undefined ? { trajectory: operation.trajectory } : {}),
+      arguments: argumentsValue,
+    });
+    if (!uuid.test(snapshot.operationVersionId) || !reference.test(snapshot.actionKey) ||
+      !reference.test(snapshot.principalId) || !reference.test(snapshot.sessionId) ||
+      (snapshot.resourceId !== undefined && snapshot.resourceId !== null &&
+        !reference.test(snapshot.resourceId)) || !jsonObject(snapshot.arguments) ||
+      Buffer.byteLength(goJSON(snapshot.arguments)) > 64 * 1024 ||
+      !['application_session', 'service_identity'].includes(snapshot.principalSource) ||
+      !['application_lookup', 'not_applicable'].includes(snapshot.resourceSource)) {
+      throw new Error('Action contract is invalid');
+    }
+    return { ...snapshot, requestId: randomUUID() };
+  }
+
+  /** Signs one phase; callers enforcing a decision must apply the outcome themselves. */
+  async evaluate(call: ObservedCall, phase: Phase, expectedMode: 'observe' | 'enforce',
+    result?: unknown): Promise<ObserveDecision> {
     const attribution = {
       principalId: call.principalId,
       sessionId: call.sessionId,
@@ -234,7 +233,7 @@ export class ObserveClient {
       !('requestId' in decision) ||
       decision.requestId !== call.requestId ||
       !('mode' in decision) ||
-      decision.mode !== 'observe' ||
+      decision.mode !== expectedMode ||
       !('enforced' in decision) ||
       !('coverage' in decision) ||
       !('outcome' in decision) ||
@@ -243,6 +242,7 @@ export class ObserveClient {
       typeof decision.outcome !== 'string' ||
       !coverage.has(decision.coverage) ||
       !outcomes.has(decision.outcome)
+      || ('reportReplayed' in decision && typeof decision.reportReplayed !== 'boolean')
     ) {
       throw new Error('Sidecar decision contract is invalid');
     }

@@ -59,11 +59,12 @@ export type ObserveOperation = {
 /** Advisory local decision; recording status is separate from evaluation coverage. */
 export type ObserveDecision = {
   requestId: string;
-  mode: 'observe';
+  mode: 'observe' | 'enforce';
   enforced: false;
   coverage: 'evaluated' | 'uncovered' | 'unavailable';
   outcome: 'allow' | 'deny' | 'approval_required' | 'additional_context_required' | 'indeterminate';
   recordingStatus?: 'retained' | 'queued' | 'unavailable';
+  reportReplayed?: boolean;
   actionId?: string;
   certificateId?: string;
   [key: string]: unknown;

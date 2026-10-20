@@ -14,19 +14,22 @@ endpoint.
 - The sidecar verifies the application proof, evaluates the active signed Rails,
   and reports bounded decision metadata to AuthRail. Its durable queue handles
   interrupted report delivery.
-- AuthRail retains accepted Actions, Observe certificates, Activity Records,
+- AuthRail retains accepted Actions, decision certificates, Activity Records,
   and customer logs. A sidecar response distinguishes retained, queued, and
   unavailable reporting.
 
 The SDK does not independently establish that an application claim is true or
 that every action passed through the hook. Observe never blocks the function.
-Missing or invalid checks are coverage gaps, not allow decisions.
+Enforce requires a covered, centrally retained allow before invoking the
+callback and another allow before releasing its result. A failed result check
+cannot undo an effect. Missing or invalid checks never become allow decisions.
 
 ## Code layout
 
 - `src/index.ts` is the public package entry point.
 - `src/observe/client.ts` owns client configuration, the protected-function
   wrapper, request signing, HTTP exchange, and advisory failure behavior.
+- `src/observe/enforce.ts` owns the fail-closed protected callback boundary.
 - `src/observe/protocol.ts` owns bounded JSON encoding and the exact signed
   protocol representation shared with the sidecar.
 - `src/observe/types.ts` owns the public Observe types.
