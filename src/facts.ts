@@ -13,6 +13,8 @@ const field = /^[A-Za-z][A-Za-z0-9_]{0,79}$/;
 const digest = /^[0-9a-f]{64}$/;
 const stripeAccount = /^acct_[A-Za-z0-9]{8,80}$/;
 const stripeInvoice = /^in_[A-Za-z0-9]{4,100}$/;
+const quickBooksRealm = /^[A-Za-z0-9_-]{1,80}$/;
+const quickBooksInvoice = /^[A-Za-z0-9_-]{1,80}$/;
 
 export type CustomerSource = { sourceVersionId: string; sourceIdentity: string;
   accountBoundary: string; lookup: string; timeoutMs: number };
@@ -43,13 +45,11 @@ export async function lookupStripeInvoiceStatus(source: {
     return JSON.parse(body) as unknown;
   };
   try {
-    if (!source.connectedAccount) {
-      const accountValue = await request('account', false);
-      if (!accountValue || typeof accountValue !== 'object' || Array.isArray(accountValue) ||
-        !('object' in accountValue) || accountValue.object !== 'account' ||
-        !('id' in accountValue) || accountValue.id !== source.providerAccountId) {
-        return { ...resolution, status: 'untrusted' };
-      }
+    const accountValue = await request('account', !!source.connectedAccount);
+    if (!accountValue || typeof accountValue !== 'object' || Array.isArray(accountValue) ||
+      !('object' in accountValue) || accountValue.object !== 'account' ||
+      !('id' in accountValue) || accountValue.id !== source.providerAccountId) {
+      return { ...resolution, status: 'untrusted' };
     }
     const invoiceValue = await request(`invoices/${invoiceId}`, !!source.connectedAccount);
     if (controller.signal.aborted) return resolution;
@@ -62,6 +62,51 @@ export async function lookupStripeInvoiceStatus(source: {
     }
     return { ...resolution, status: 'ok', observedAt: new Date().toISOString(),
       value: { status: invoiceValue.status as string } };
+  } catch { return resolution; }
+  finally { clearTimeout(timer); }
+}
+
+export type QuickBooksInvoiceSource = {
+  sourceVersionId: string; providerAccountId: string; sandbox?: boolean;
+  timeoutMs: number; accessToken: string; fetch?: typeof globalThis.fetch;
+};
+
+/** Reads one invoice in the reviewed QuickBooks realm with a protected OAuth token. */
+export async function lookupQuickBooksInvoiceBalance(source: QuickBooksInvoiceSource,
+  invoiceId: string): Promise<FactResolution> {
+  if (!uuid.test(source.sourceVersionId) || !quickBooksRealm.test(source.providerAccountId) ||
+    !quickBooksInvoice.test(invoiceId) || !validTimeout(source.timeoutMs) ||
+    (source.sandbox !== undefined && typeof source.sandbox !== 'boolean') ||
+    !source.accessToken?.trim() || /[\r\n]/.test(source.accessToken)) {
+    throw new Error('QuickBooks fact lookup configuration is invalid');
+  }
+  const resolution: FactResolution = { sourceVersionId: source.sourceVersionId,
+    providerAccountId: source.providerAccountId, lookup: 'invoice.read',
+    lookupKey: invoiceId, authenticatedExecutor: true, status: 'unavailable' };
+  const host = source.sandbox ? 'sandbox-quickbooks.api.intuit.com' : 'quickbooks.api.intuit.com';
+  const url = `https://${host}/v3/company/${source.providerAccountId}/invoice/${invoiceId}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), source.timeoutMs);
+  try {
+    const response = await (source.fetch ?? fetch)(url, { method: 'GET', redirect: 'manual',
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${source.accessToken}`, Accept: 'application/json' } });
+    if (response.status !== 200) return resolution;
+    const body = await readBoundedText(response, 64 * 1024);
+    if (controller.signal.aborted) return resolution;
+    let value: unknown;
+    try { value = JSON.parse(body) as unknown; }
+    catch { return { ...resolution, status: 'untrusted' }; }
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      !('Invoice' in value) || !value.Invoice || typeof value.Invoice !== 'object' ||
+      Array.isArray(value.Invoice) || !('Id' in value.Invoice) ||
+      value.Invoice.Id !== invoiceId || !('Balance' in value.Invoice) ||
+      typeof value.Invoice.Balance !== 'number' ||
+      !Number.isFinite(value.Invoice.Balance) || value.Invoice.Balance < 0) {
+      return { ...resolution, status: 'untrusted' };
+    }
+    return { ...resolution, status: 'ok', observedAt: new Date().toISOString(),
+      value: { Invoice: { Balance: value.Invoice.Balance } } };
   } catch { return resolution; }
   finally { clearTimeout(timer); }
 }

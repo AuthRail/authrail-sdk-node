@@ -58,6 +58,20 @@ Inventory item and deployment. It does not issue a deployment credential or
 authorize an action. Keep the setup key in the protected application.
 
 `lookupStripeInvoiceStatus` reads the reviewed Stripe account and invoice;
+for Stripe Connect it verifies the connected account with `Stripe-Account` on
+both reads.
+`lookupQuickBooksInvoiceBalance` reads one invoice from the reviewed QuickBooks
+Online realm using an application-owned OAuth access token. Set `sandbox: true`
+only for an Intuit test company; otherwise the fixed production endpoint is
+used. The result has `Invoice.Balance`, matching the reviewed Data Rail. A
+different invoice ID or invalid balance is `untrusted`; provider failure or a
+redirect is `unavailable`. The caller supplies the exact realm, invoice ID,
+timeout, and Context Source Version from the reviewed contract, never from the
+agent. The caller owns token acquisition and refresh; the SDK does not store a
+refresh token or create a QuickBooks connection. `Balance` is in the invoice's
+currency; this source contract does not pin a currency, so a numeric threshold
+must not be presented as currency-qualified without another reviewed source.
+
 `lookupCustomerFact` accepts an application-owned read callback, and
 `newCustomerAPIReader` supplies a fixed HTTPS GET callback. Each returns an
 `ok`, `unavailable`, or `untrusted` fact resolution bound to the reviewed
@@ -73,6 +87,35 @@ a signed fact resolution. The model supplies context, not a Rail decision.
 AuthRail receives bounded provenance and status, not the raw document or
 fact value. The callback must honor its abort signal; the SDK cannot forcibly
 stop an arbitrary callback that ignores cancellation.
+
+For the reviewed OpenAI Decisions source, use `gpt-6-luna` and one predicate,
+choice, or score question. Pin `openAIDecisionsConfigSha256(question)` as the
+Context Source Version's settings fingerprint before publishing it. The
+protected application uses that same reviewed question and supplies its own
+OpenAI key; the key and raw document never go to the agent, sidecar, or
+AuthRail server. For example:
+
+```ts
+const question = { type: "predicate", instructions: "Does this message contain a payment card number?",
+  minConfidence: 0.8 } as const;
+if (openAIDecisionsConfigSha256(question) !== reviewedSource.modelConfigSha256) {
+  throw new Error("The reviewed contextual question has changed");
+}
+const extractor = newOpenAIDecisionsExtractor({ source: reviewedSource, question,
+  apiKey: openAiKeyHeldByApplication });
+const fact = await extractContextFact(reviewedSource, message.id, message.sourceLocation,
+  message.observedAt, message.bytes, extractor);
+operation.factResolutions = [fact];
+```
+
+The Decisions API receives only the bounded document text from this protected
+application. A refusal or a predicate probability between the reviewed true
+and false thresholds produces `uncertain`; a sufficiently low probability
+produces `false`. Choice and score answers below the confidence threshold are
+also `uncertain`. A timeout or provider failure produces `unavailable`.
+Neither status supplies a trusted fact. A sufficiently confident answer is
+still contextual input to the published Rail, never a final allow decision or
+independent proof that the model understood the document.
 
 ```ts
 const fact = await lookupCustomerFact(reviewedSource, invoice.id,

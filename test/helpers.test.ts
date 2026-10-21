@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { discover, extractContextFact, lookupCustomerFact,
-  lookupStripeInvoiceStatus, newCustomerAPIReader } from '../src/index.js';
+  lookupQuickBooksInvoiceBalance, lookupStripeInvoiceStatus,
+  newCustomerAPIReader } from '../src/index.js';
 
 const sourceVersionId = '11111111-1111-4111-8111-111111111111';
 
@@ -60,11 +61,61 @@ test('Stripe lookup checks account and invoice; connected account sends reviewed
   assert.deepEqual(requests, ['https://api.stripe.com/v1/account',
     'https://api.stripe.com/v1/invoices/in_1234']);
   const connected = await lookupStripeInvoiceStatus({ ...source, connectedAccount: true,
-    fetch: async (_url, init) => {
+    fetch: async (url, init) => {
       assert.equal(new Headers(init?.headers).get('Stripe-Account'), accountId);
+      if (String(url).endsWith('/account'))
+        return new Response(JSON.stringify({ id: accountId, object: 'account' }));
       return new Response(JSON.stringify({ id: 'in_1234', object: 'invoice', status: 'paid' }));
     } }, 'in_1234');
   assert.equal(connected.value?.status, 'paid');
+  const wrongConnectedAccount = await lookupStripeInvoiceStatus({ ...source,
+    connectedAccount: true, fetch: async (url) => {
+      assert.ok(String(url).endsWith('/account'));
+      return new Response(JSON.stringify({ id: 'acct_987654321', object: 'account' }));
+    } }, 'in_1234');
+  assert.equal(wrongConnectedAccount.status, 'untrusted');
+});
+
+test('QuickBooks lookup binds reviewed realm and invoice and returns the Rail value shape', async () => {
+  const source = { sourceVersionId, providerAccountId: '1234567890',
+    timeoutMs: 500, accessToken: 'protected-oauth', sandbox: true,
+    fetch: async (url: URL | RequestInfo, init?: RequestInit) => {
+      assert.equal(String(url),
+        'https://sandbox-quickbooks.api.intuit.com/v3/company/1234567890/invoice/42');
+      assert.equal(init?.method, 'GET');
+      assert.equal(init?.redirect, 'manual');
+      assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer protected-oauth');
+      return new Response(JSON.stringify({ Invoice: { Id: '42', Balance: 12.5 } }));
+    } };
+  const found = await lookupQuickBooksInvoiceBalance(source, '42');
+  assert.equal(found.status, 'ok');
+  assert.equal(found.providerAccountId, '1234567890');
+  assert.equal(found.lookupKey, '42');
+  assert.deepEqual(found.value, { Invoice: { Balance: 12.5 } });
+  assert.ok(found.observedAt);
+
+  const wrongInvoice = await lookupQuickBooksInvoiceBalance({ ...source,
+    fetch: async () => new Response(JSON.stringify({ Invoice: { Id: '43', Balance: 0 } })) }, '42');
+  assert.equal(wrongInvoice.status, 'untrusted');
+  const malformed = await lookupQuickBooksInvoiceBalance({ ...source,
+    fetch: async () => new Response('{invalid') }, '42');
+  assert.equal(malformed.status, 'untrusted');
+  const oversized = await lookupQuickBooksInvoiceBalance({ ...source,
+    fetch: async () => new Response('x'.repeat(64 * 1024 + 1)) }, '42');
+  assert.equal(oversized.status, 'unavailable');
+  const redirect = await lookupQuickBooksInvoiceBalance({ ...source,
+    fetch: async () => new Response(null, { status: 302, headers: { Location: 'https://elsewhere/' } }) }, '42');
+  assert.equal(redirect.status, 'unavailable');
+  const failed = await lookupQuickBooksInvoiceBalance({ ...source,
+    fetch: async () => { throw new Error('network'); } }, '42');
+  assert.equal(failed.status, 'unavailable');
+  const production = await lookupQuickBooksInvoiceBalance({ ...source, sandbox: false,
+    fetch: async (url) => {
+      assert.equal(String(url), 'https://quickbooks.api.intuit.com/v3/company/1234567890/invoice/42');
+      return new Response(JSON.stringify({ Invoice: { Id: '42', Balance: 0 } }));
+    } }, '42');
+  assert.equal(production.status, 'ok');
+  await assert.rejects(lookupQuickBooksInvoiceBalance(source, '../other'));
 });
 
 test('AI extraction binds reviewed model and returns only a bounded typed fact', async () => {
