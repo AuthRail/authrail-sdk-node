@@ -310,6 +310,53 @@ export class ObserveClient {
     }
     return permit as { permitId: string; actionId: string; expiresAt: string };
   }
+
+  /** Signs one executor assertion; only the protected application can know the provider outcome. */
+  async reportExecution(input: { actionId: string; attemptId: string;
+    permitId: string | null; event: 'started' | 'succeeded' | 'failed' | 'unknown' |
+      'reconciled_succeeded' | 'reconciled_failed'; inputSha256: string;
+    providerIdempotencyKey: string; providerReference: string | null }): Promise<{
+      receiptId: string; state: string; replayed: boolean }> {
+    const publicKey = createPublicKey(this.#privateKey).export({ format: 'jwk' });
+    if (typeof publicKey.x !== 'string') throw new Error('Executor key is invalid');
+    const keySha256 = createHash('sha256').update(Buffer.from(publicKey.x, 'base64url')).digest('hex');
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const expiresAt = issuedAt + 30;
+    const statement = fields([
+      ['type', goJSON('authrail.execution.receipt.v1')],
+      ['organisationId', goJSON(this.#organisationId)],
+      ['deploymentId', goJSON(this.#deploymentId)],
+      ['actionId', goJSON(input.actionId)],
+      ['attemptId', goJSON(input.attemptId)],
+      ['permitId', goJSON(input.permitId)],
+      ['event', goJSON(input.event)],
+      ['inputSha256', goJSON(input.inputSha256)],
+      ['providerIdempotencyKey', goJSON(input.providerIdempotencyKey)],
+      ['providerReference', goJSON(input.providerReference)],
+      ['keySha256', goJSON(keySha256)],
+      ['issuedAt', goJSON(issuedAt)],
+      ['expiresAt', goJSON(expiresAt)],
+    ]);
+    const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
+    const response = await this.#fetch(new URL('/execution-receipts', this.#endpoint), {
+      method: 'POST', redirect: 'manual',
+      headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json',
+        'Idempotency-Key': `${input.actionId}:${input.attemptId}:${input.event}` },
+      body: JSON.stringify({ ...input, keySha256,
+        proof: { issuedAt, expiresAt, signature } }),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (response.status !== 201) throw new Error(`Execution receipt returned HTTP ${response.status}`);
+    const result = await boundedJSON(response);
+    if (!result || typeof result !== 'object' || Array.isArray(result) ||
+      !('receiptId' in result) || typeof result.receiptId !== 'string' ||
+      !uuid.test(result.receiptId) || !('state' in result) ||
+      typeof result.state !== 'string' || !('replayed' in result) ||
+      typeof result.replayed !== 'boolean') {
+      throw new Error('Execution receipt response is invalid');
+    }
+    return result as { receiptId: string; state: string; replayed: boolean };
+  }
 }
 
 function validReviewSummary(value: unknown): boolean {

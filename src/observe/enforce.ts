@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { ObserveClient } from './client.js';
 import type { ObservedCall } from './protocol.js';
-import { goJSON, jsonObject } from './protocol.js';
+import { encodeInput, goJSON, jsonObject } from './protocol.js';
 import type { JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from './types.js';
 
 /** A blocked Enforce check. A result-phase block cannot undo an earlier tool effect. */
@@ -20,7 +21,8 @@ export class EnforceBlockedError extends Error {
 export class EnforceOutcomeUnknownError extends Error {
   readonly effectMayHaveOccurred = true;
 
-  constructor(cause: unknown) {
+  constructor(cause: unknown, readonly recovery?: { actionId: string; attemptId: string;
+    permitId: string | null; inputSha256: string; providerIdempotencyKey: string }) {
     super('Protected tool outcome is unknown; reconcile before retrying', { cause });
     this.name = 'EnforceOutcomeUnknownError';
   }
@@ -31,7 +33,7 @@ export class EnforceClient {
   readonly #sidecar: ObserveClient;
   readonly #pending = new WeakMap<EnforceBlockedError,
     { call: ObservedCall; decision: ObserveDecision;
-      execute: (checkedArguments: JSONObject) => JSONObject | Promise<JSONObject> }>();
+      execute: (checkedArguments: JSONObject, context: ExecutionContext) => JSONObject | Promise<JSONObject> }>();
 
   constructor(config: ObserveClientConfig) {
     this.#sidecar = new ObserveClient(config);
@@ -40,7 +42,7 @@ export class EnforceClient {
   async enforce<Result extends JSONObject>(
     operation: ObserveOperation,
     argumentsValue: JSONObject,
-    execute: (checkedArguments: JSONObject) => Result | Promise<Result>,
+    execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
   ): Promise<{ result: Result; callDecision: ObserveDecision; resultDecision: ObserveDecision }> {
     if (typeof execute !== 'function') throw new Error('Protected tool function is required');
     let call;
@@ -59,7 +61,7 @@ export class EnforceClient {
       throw blocked;
     }
 
-    const { result, resultDecision } = await this.#execute(call, execute);
+    const { result, resultDecision } = await this.#execute(call, execute, callDecision, null);
     return { result, callDecision, resultDecision };
   }
 
@@ -78,17 +80,53 @@ export class EnforceClient {
     if (Date.parse(permit.expiresAt) <= Date.now()) {
       throw new EnforceBlockedError('tool_call', false, pending.decision);
     }
-    const { result, resultDecision } = await this.#execute(pending.call, pending.execute);
+    const { result, resultDecision } = await this.#execute(
+      pending.call, pending.execute, pending.decision, permit.permitId);
     return { result, permitId: permit.permitId, resultDecision };
   }
 
+  /** Resolves an uncertain attempt only after the executor has checked the provider by idempotency key. */
+  async reconcile(input: { actionId: string; attemptId: string; permitId: string | null;
+    inputSha256: string; providerIdempotencyKey: string;
+    providerReference: string; outcome: 'succeeded' | 'failed' }) {
+    return this.#sidecar.reportExecution({ actionId: input.actionId,
+      attemptId: input.attemptId, permitId: input.permitId,
+      inputSha256: input.inputSha256,
+      providerIdempotencyKey: input.providerIdempotencyKey,
+      providerReference: input.providerReference,
+      event: input.outcome === 'succeeded' ? 'reconciled_succeeded' : 'reconciled_failed' });
+  }
+
   async #execute<Result extends JSONObject>(call: ObservedCall,
-    execute: (checkedArguments: JSONObject) => Result | Promise<Result>) {
+    execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
+    decision: ObserveDecision, permitId: string | null) {
+    if (!decision.actionId) throw new EnforceBlockedError('tool_call', false, decision);
+    const recovery = { actionId: decision.actionId, attemptId: call.requestId, permitId,
+      inputSha256: createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex'),
+      providerIdempotencyKey: `ar-${decision.actionId}` };
+    try {
+      const started = await this.#sidecar.reportExecution({ ...recovery,
+        event: 'started', providerReference: null });
+      if (started.state !== 'executing' || started.replayed) {
+        throw new Error('Execution start was not fresh');
+      }
+    } catch (cause) {
+      // A lost acknowledgement cannot authorize a provider call.
+      throw new EnforceBlockedError('tool_call', false, decision, cause);
+    }
     // Only the protected application receives this callback and provider credentials.
     // The SDK cannot prove that a separate agent path cannot reach the same effect.
     let result: Result;
-    try { result = await execute(call.arguments) as Result; }
-    catch (cause) { throw new EnforceOutcomeUnknownError(cause); }
+    try { result = await execute(call.arguments, recovery) as Result; }
+    catch (cause) {
+      try { await this.#sidecar.reportExecution({ ...recovery,
+        event: 'unknown', providerReference: null }); } catch { /* recovery remains required */ }
+      throw new EnforceOutcomeUnknownError(cause, recovery);
+    }
+    try {
+      await this.#sidecar.reportExecution({ ...recovery,
+        event: 'succeeded', providerReference: null });
+    } catch (cause) { throw new EnforceOutcomeUnknownError(cause, recovery); }
     let bounded = false;
     try { bounded = jsonObject(result) && Buffer.byteLength(goJSON(result)) <= 64 * 1024; }
     catch { bounded = false; }
@@ -103,6 +141,10 @@ export class EnforceClient {
     return { result, resultDecision };
   }
 }
+
+/** Persist this identity with the provider request so restart recovery can query its outcome. */
+export type ExecutionContext = { actionId: string; attemptId: string;
+  permitId: string | null; inputSha256: string; providerIdempotencyKey: string };
 
 function permitted(decision: ObserveDecision): boolean {
   return decision.mode === 'enforce' && decision.enforced === false &&

@@ -22,6 +22,30 @@ const deploymentId = '00000000-0000-4000-8000-000000000002';
 const operationVersionId = '00000000-0000-4000-8000-000000000003';
 const adapterToken = 'abcdefghijklmnopqrstuvwxyz012345';
 const keys = generateKeyPairSync('ed25519');
+const actionId = '00000000-0000-4000-8000-000000000004';
+
+function receiptResponse(init: RequestInit | undefined, events?: string[]): Response {
+  const body = JSON.parse(String(init?.body)) as { actionId: string; attemptId: string;
+    permitId: string | null; event: string; inputSha256: string;
+    providerIdempotencyKey: string; providerReference: string | null;
+    keySha256: string; proof: { issuedAt: number; expiresAt: number; signature: string } };
+  assert.equal(body.actionId, actionId);
+  assert.equal(body.providerIdempotencyKey, `ar-${actionId}`);
+  const statement = JSON.stringify({ type: 'authrail.execution.receipt.v1',
+    organisationId, deploymentId, actionId: body.actionId,
+    attemptId: body.attemptId, permitId: body.permitId, event: body.event,
+    inputSha256: body.inputSha256,
+    providerIdempotencyKey: body.providerIdempotencyKey,
+    providerReference: body.providerReference, keySha256: body.keySha256,
+    issuedAt: body.proof.issuedAt, expiresAt: body.proof.expiresAt });
+  assert.equal(verify(null, Buffer.from(statement), keys.publicKey,
+    Buffer.from(body.proof.signature, 'base64url')), true);
+  events?.push(body.event);
+  return new Response(JSON.stringify({ receiptId: randomUUID(),
+    state: body.event === 'started' ? 'executing' :
+      body.event === 'unknown' ? 'outcome_unknown' : 'succeeded', replayed: false }),
+  { status: 201 });
+}
 
 function operation(): ObserveOperation {
   return {
@@ -53,12 +77,19 @@ function enforceClient(fetchImpl: typeof fetch) {
 
 test('Enforce runs only after a retained allow and checks the result before exposure', async () => {
   const phases: string[] = [];
+  let callRequestId: string | undefined;
   const adapter = enforceClient(async (_url, init) => {
+    if (new URL(String(_url)).pathname === '/execution-receipts') {
+      const receipt = JSON.parse(String(init?.body)) as { attemptId: string };
+      assert.equal(receipt.attemptId, callRequestId);
+      return receiptResponse(init, phases);
+    }
     const body = requestBody(init);
+    if (body.phase === 'tool_call') callRequestId = body.requestId;
     phases.push(body.phase);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated', outcome: 'allow',
-      recordingStatus: 'retained', reportReplayed: false }),
+      recordingStatus: 'retained', reportReplayed: false, actionId }),
       { status: 200 });
   });
   let effects = 0;
@@ -67,13 +98,14 @@ test('Enforce runs only after a retained allow and checks the result before expo
     return { status: 'paid' };
   });
   assert.equal(effects, 1);
-  assert.deepEqual(phases, ['tool_call', 'tool_result']);
+  assert.deepEqual(phases, ['tool_call', 'started', 'succeeded', 'tool_result']);
   assert.deepEqual(completed.result, { status: 'paid' });
 });
 
 test('Enforce signs the bounded human summary only on the call', async () => {
   let checked = 0;
   const adapter = enforceClient(async (_url, init) => {
+    if (new URL(String(_url)).pathname === '/execution-receipts') return receiptResponse(init);
     const body = requestBody(init);
     if (body.phase === 'tool_call') {
       assert.equal(body.reviewSummary?.title, 'Pay invoice');
@@ -91,7 +123,7 @@ test('Enforce signs the bounded human summary only on the call', async () => {
     checked++;
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated', outcome: 'allow',
-      recordingStatus: 'retained', reportReplayed: false }), { status: 200 });
+      recordingStatus: 'retained', reportReplayed: false, actionId }), { status: 200 });
   });
   await adapter.enforce({ ...operation(), reviewSummary: { title: 'Pay invoice',
     fields: [{ label: 'Amount', value: '400' }] } }, { amount: 400 }, () => ({ paid: true }));
@@ -128,12 +160,13 @@ test('Enforce stops denied or unrecorded calls and withholds denied results', as
   assert.equal(effects, 0);
   let checks = 0;
   const resultAdapter = enforceClient(async (_url, init) => {
+    if (new URL(String(_url)).pathname === '/execution-receipts') return receiptResponse(init);
     const body = requestBody(init);
     checks++;
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated',
       outcome: checks === 1 ? 'allow' : 'deny', recordingStatus: 'retained',
-      reportReplayed: false }), { status: 200 });
+      reportReplayed: false, actionId }), { status: 200 });
   });
   await assert.rejects(resultAdapter.enforce(operation(), {}, effect), (error) =>
     error instanceof EnforceBlockedError && error.phase === 'tool_result' &&
@@ -153,25 +186,64 @@ test('Enforce does not run the protected call while the sidecar is offline', asy
 });
 
 test('Enforce preserves an uncertain tool outcome for reconciliation', async () => {
+  const events: string[] = [];
   const adapter = enforceClient(async (_url, init) => {
+    if (new URL(String(_url)).pathname === '/execution-receipts') return receiptResponse(init, events);
     const body = requestBody(init);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated', outcome: 'allow',
-      recordingStatus: 'retained', reportReplayed: false }), { status: 200 });
+      recordingStatus: 'retained', reportReplayed: false, actionId }), { status: 200 });
   });
   await assert.rejects(adapter.enforce(operation(), {}, () => {
     throw new Error('provider timed out');
-  }), EnforceOutcomeUnknownError);
+  }), (error) => error instanceof EnforceOutcomeUnknownError &&
+    error.recovery?.actionId === actionId &&
+    error.recovery.providerIdempotencyKey === `ar-${actionId}`);
+  assert.deepEqual(events, ['started', 'unknown']);
+});
+
+test('Enforce does not call the provider when the start receipt is uncertain', async () => {
+  let effects = 0;
+  const adapter = enforceClient(async (url, init) => {
+    if (new URL(String(url)).pathname === '/execution-receipts') {
+      throw new Error('receipt response lost');
+    }
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow',
+      recordingStatus: 'retained', reportReplayed: false, actionId }), { status: 200 });
+  });
+  await assert.rejects(adapter.enforce(operation(), {}, () => {
+    effects++; return { paid: true };
+  }), (error) => error instanceof EnforceBlockedError &&
+    error.phase === 'tool_call' && !error.effectMayHaveOccurred);
+  assert.equal(effects, 0);
+});
+
+test('reconciliation signs the caller-reported provider outcome without rerunning the function', async () => {
+  const events: string[] = [];
+  const adapter = enforceClient(async (url, init) => {
+    assert.equal(new URL(String(url)).pathname, '/execution-receipts');
+    assert.equal(new Headers(init?.headers).get('Idempotency-Key')?.endsWith(
+      ':reconciled_succeeded'), true);
+    return receiptResponse(init, events);
+  });
+  const result = await adapter.reconcile({ actionId, attemptId: randomUUID(),
+    permitId: null, inputSha256: 'a'.repeat(64),
+    providerIdempotencyKey: `ar-${actionId}`,
+    providerReference: 'provider-payment-123', outcome: 'succeeded' });
+  assert.equal(result.state, 'succeeded');
+  assert.deepEqual(events, ['reconciled_succeeded']);
 });
 
 test('approval resumes the original call only after a one-use claim', async () => {
-  const actionId = randomUUID();
   const approvalRequestId = randomUUID();
   const permitId = randomUUID();
   const requests: string[] = [];
   const adapter = enforceClient(async (url, init) => {
     const path = new URL(String(url)).pathname;
     requests.push(path);
+    if (path === '/execution-receipts') return receiptResponse(init);
     if (path === '/approval-permits/claim') {
       const claim = JSON.parse(String(init?.body)) as { actionId: string;
         approvalRequestId: string; proof: { signature: string; issuedAt: number;
@@ -208,7 +280,8 @@ test('approval resumes the original call only after a one-use claim', async () =
   const resumed = await adapter.resumeApproval(blocked);
   assert.equal(resumed.permitId, permitId);
   assert.equal(effects, 1);
-  assert.deepEqual(requests, ['/evaluate', '/approval-permits/claim', '/evaluate']);
+  assert.deepEqual(requests, ['/evaluate', '/approval-permits/claim',
+    '/execution-receipts', '/execution-receipts', '/evaluate']);
   await assert.rejects(adapter.resumeApproval(blocked), EnforceBlockedError);
   assert.equal(effects, 1);
 });

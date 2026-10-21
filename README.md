@@ -137,22 +137,38 @@ After reviewing the deployment's connection and bypass paths, use
 import { EnforceClient } from "@authrail/sdk-node";
 
 const authrail = new EnforceClient(config);
+// Reuse operation.actionKey for this business action across process restarts.
 const checked = await authrail.enforce(operation, { invoiceId: invoice.id },
-  (checkedArguments) => invoiceService.read(checkedArguments.invoiceId));
+  (checkedArguments, execution) => invoiceService.pay(checkedArguments.invoiceId, {
+    idempotencyKey: execution.providerIdempotencyKey,
+  }));
 return checked.result;
 ```
 
-The callback runs only after a covered `allow` decision has been retained by
-AuthRail. The SDK checks a successful result before returning it to the agent.
+The callback runs only after a covered `allow` decision and a signed `started`
+receipt have been retained by AuthRail. The SDK checks a successful result
+before returning it to the agent.
 It stops on denial, missing coverage, approval required, sidecar failure, or a
 report that has only been queued. An already retained call with the same action
-key also stops so a retry cannot silently run the effect again before execution
-receipts are available. Investigate that Action before creating a new business
-attempt. `EnforceBlockedError` identifies the phase; `effectMayHaveOccurred`
+key also stops until the executor reconciles that Action. After a provider
+lookup establishes no effect, report `outcome: "failed"` through `reconcile`,
+then call `enforce` again with the same business action key and business
+arguments. Fresh facts and trajectory can inform the new Rail decision, which
+may require a new approval and
+permit. Pass the same `execution.providerIdempotencyKey` to the provider. A
+changed effect input needs a new business key. `EnforceBlockedError` identifies
+the phase; `effectMayHaveOccurred`
 is true for a blocked result because the function has
-already run. A function error raises `EnforceOutcomeUnknownError`: reconcile
-the external effect before retrying with the same stable action key. The SDK
-does not automatically retry a business effect.
+already run. A function error or lost completion receipt raises
+`EnforceOutcomeUnknownError` with `recovery` identifiers. Check the provider
+using the same idempotency key; then call `authrail.reconcile({
+...error.recovery, providerReference, outcome: "succeeded" })` or use
+`outcome: "failed"` only after that check. Keep the recovery identifiers with
+the provider request so process loss can be resolved. The SDK never retries a
+business effect automatically. A stale attempt appears as unknown in customer
+history after one minute and the worker durably marks it unknown.
+AuthRail authenticates the registered executor's reconciliation report; the
+provider's record is the source of the no-effect determination.
 
 When a retained decision requires approval, catch its `EnforceBlockedError`
 and keep that error with the pending workflow. Its `decision.approvalRequestId`
@@ -178,8 +194,9 @@ again.
 Keep the function and provider credentials unreachable from the agent through
 other tools, network paths, or secret access. A sidecar decision and a saved
 certificate do not independently prove that the callback ran or that no
-bypass exists. The approval permit records permission, not execution.
-Authenticated execution receipts remain a separate capability.
+bypass exists. The approval permit records permission, not execution. A signed
+receipt proves what the registered application reported; the provider's actual
+record remains the source for reconciliation.
 
 ## Work on this SDK
 

@@ -1,5 +1,6 @@
 export { ObserveClient } from './observe/client.js';
 export { EnforceClient, EnforceBlockedError, EnforceOutcomeUnknownError } from './observe/enforce.js';
+export type { ExecutionContext } from './observe/enforce.js';
 export type {
   ExtractionProvenance,
   FactResolution,

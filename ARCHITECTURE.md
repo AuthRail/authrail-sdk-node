@@ -20,9 +20,16 @@ endpoint.
 
 The SDK does not independently establish that an application claim is true or
 that every action passed through the hook. Observe never blocks the function.
-Enforce requires a covered, centrally retained allow before invoking the
-callback and another allow before releasing its result. A failed result check
-cannot undo an effect. Missing or invalid checks never become allow decisions.
+Enforce requires a covered, centrally retained allow and an authenticated
+`started` receipt before invoking the callback. The callback receives a stable
+provider idempotency reference derived from the Action. The SDK reports
+completion or uncertainty separately from the result check; a failed result
+check cannot undo an effect. Missing or invalid checks never become allow
+decisions. Unknown outcomes require an executor-owned provider lookup and a
+signed reconciliation report; the SDK never retries the effect itself.
+After an authenticated no-effect reconciliation, a caller may invoke Enforce
+again with the same action key and business arguments. The new signed call ID
+is its attempt ID; current Rails and any required approval are checked anew.
 
 ## Code layout
 
