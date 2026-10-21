@@ -36,7 +36,7 @@ is its attempt ID; current Rails and any required approval are checked anew.
 - `src/index.ts` is the public package entry point.
 - `src/observe/client.ts` owns client configuration, the protected-function
   wrapper, request signing, HTTP exchange, and advisory failure behavior.
-- `src/observe/enforce.ts` owns the fail-closed protected callback boundary.
+- `src/enforce/client.ts` owns the fail-closed protected callback boundary.
 - `src/observe/protocol.ts` owns bounded JSON encoding and the exact signed
   protocol representation shared with the sidecar.
 - `src/observe/types.ts` owns the public Observe types.

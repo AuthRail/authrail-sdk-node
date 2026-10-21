@@ -61,6 +61,8 @@ export type ObserveOperation = {
   factResolutions?: FactResolution[];
   trajectory?: TrajectorySnapshot;
   reviewSummary?: ReviewSummary;
+  /** W3C correlation from protected application context, never authorization evidence. */
+  traceparent?: string;
 };
 
 /** Advisory local decision; recording status is separate from evaluation coverage. */

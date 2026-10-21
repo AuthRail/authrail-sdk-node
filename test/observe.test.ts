@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createHash, generateKeyPairSync, randomUUID, verify } from 'node:crypto';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { EnforceBlockedError, EnforceClient, EnforceOutcomeUnknownError, ObserveClient } from '../src/index.js';
 import type { ObserveOperation } from '../src/index.js';
+import { encodeInput } from '../src/observe/protocol.js';
+import type { ObservedCall } from '../src/observe/protocol.js';
 
 type RequestBody = {
   requestId: string;
@@ -75,10 +78,103 @@ function enforceClient(fetchImpl: typeof fetch) {
     organisationId, deploymentId, executorPrivateKey: keys.privateKey, fetch: fetchImpl });
 }
 
+test('shared decision conformance fixtures gate protected effects', async () => {
+  const corpus = JSON.parse(readFileSync('conformance/v1/decision-cases.json', 'utf8')) as {
+    formatVersion: number;
+    cases: Array<{ name: string; mode: string; coverage: string; outcome: string;
+      recordingStatus: string; reportReplayed?: boolean; effectRuns: boolean }> };
+  assert.equal(corpus.formatVersion, 1);
+  for (const fixture of corpus.cases) {
+    let effects = 0;
+    const adapter = enforceClient(async (url, init) => {
+      if (new URL(String(url)).pathname === '/execution-receipts') return receiptResponse(init);
+      const body = requestBody(init);
+      return new Response(JSON.stringify({ requestId: body.requestId, mode: fixture.mode,
+        enforced: false, coverage: fixture.coverage, outcome: fixture.outcome,
+        recordingStatus: fixture.recordingStatus,
+        ...(fixture.reportReplayed !== undefined ? { reportReplayed: fixture.reportReplayed } : {}),
+        actionId }), { status: 200 });
+    });
+    try { await adapter.enforce(operation(), {}, () => { effects++; return {}; }); }
+    catch { /* blocked cases must not run the protected callback */ }
+    assert.equal(effects === 1, fixture.effectRuns, fixture.name);
+  }
+});
+
+test('shared canonical input vectors match the signed Node bytes', () => {
+  const corpus = JSON.parse(readFileSync('conformance/v1/canonical-input.json', 'utf8')) as {
+    formatVersion: number;
+    cases: Array<{ name: string; phase: 'tool_call' | 'tool_result';
+      arguments: Record<string, string | number>; result?: Record<string, string>;
+      factResolutions?: ObservedCall['factResolutions'];
+      trajectory?: ObservedCall['trajectory']; canonicalInput: string }> };
+  assert.equal(corpus.formatVersion, 1);
+  for (const fixture of corpus.cases) {
+    const call = { ...operation(), requestId: randomUUID(), arguments: fixture.arguments,
+      factResolutions: fixture.factResolutions, trajectory: fixture.trajectory } as ObservedCall;
+    assert.equal(encodeInput(call, fixture.phase, fixture.result),
+      fixture.canonicalInput, fixture.name);
+  }
+});
+
+test('shared failure fixtures keep effects and result exposure distinct', async () => {
+  const corpus = JSON.parse(readFileSync('conformance/v1/failure-cases.json', 'utf8')) as {
+    formatVersion: number;
+    cases: Array<{ name: string; stage: string; effectRuns: boolean;
+      error: 'blocked_call' | 'outcome_unknown' | 'blocked_result' }> };
+  assert.equal(corpus.formatVersion, 1);
+  for (const fixture of corpus.cases) {
+    let effects = 0;
+    const adapter = enforceClient(async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/evaluate') {
+        if (fixture.stage === 'decision_unavailable') throw new Error('offline');
+        const body = requestBody(init);
+        if (fixture.stage === 'decision_malformed') return new Response('{}');
+        if (body.phase === 'tool_result' && fixture.stage === 'result_unavailable')
+          return new Response('', { status: 503 });
+        return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+          enforced: false, coverage: 'evaluated',
+          outcome: body.phase === 'tool_result' && fixture.stage === 'result_denied'
+            ? 'deny' : 'allow', recordingStatus: 'retained',
+          reportReplayed: false, actionId }), { status: 200 });
+      }
+      const receipt = JSON.parse(String(init?.body)) as { event: string };
+      if (receipt.event === 'started' && fixture.stage === 'start_unavailable')
+        return new Response('', { status: 503 });
+      if (receipt.event === 'succeeded' && fixture.stage === 'completion_unavailable')
+        return new Response('', { status: 503 });
+      if (receipt.event === 'started' && fixture.stage === 'start_replayed')
+        return new Response(JSON.stringify({ receiptId: randomUUID(), state: 'executing',
+          replayed: true }), { status: 201 });
+      return receiptResponse(init);
+    });
+    let caught: unknown;
+    try {
+      await adapter.enforce(operation(), {}, () => {
+        effects++;
+        if (fixture.stage === 'provider_unknown') throw new Error('provider timeout');
+        return { ok: true };
+      });
+    } catch (error) { caught = error; }
+    assert.equal(effects === 1, fixture.effectRuns, fixture.name);
+    if (fixture.error === 'outcome_unknown') {
+      assert.ok(caught instanceof EnforceOutcomeUnknownError, fixture.name);
+    } else {
+      assert.ok(caught instanceof EnforceBlockedError, fixture.name);
+      assert.equal(caught.phase, fixture.error === 'blocked_call' ? 'tool_call' : 'tool_result',
+        fixture.name);
+      assert.equal(caught.effectMayHaveOccurred, fixture.error === 'blocked_result', fixture.name);
+    }
+  }
+});
+
 test('Enforce runs only after a retained allow and checks the result before exposure', async () => {
+  const traceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
   const phases: string[] = [];
   let callRequestId: string | undefined;
   const adapter = enforceClient(async (_url, init) => {
+    assert.equal(new Headers(init?.headers).get('traceparent'), traceparent);
     if (new URL(String(_url)).pathname === '/execution-receipts') {
       const receipt = JSON.parse(String(init?.body)) as { attemptId: string };
       assert.equal(receipt.attemptId, callRequestId);
@@ -93,7 +189,7 @@ test('Enforce runs only after a retained allow and checks the result before expo
       { status: 200 });
   });
   let effects = 0;
-  const completed = await adapter.enforce(operation(), { invoiceId: 'invoice_123' }, () => {
+  const completed = await adapter.enforce({ ...operation(), traceparent }, { invoiceId: 'invoice_123' }, () => {
     effects++;
     return { status: 'paid' };
   });

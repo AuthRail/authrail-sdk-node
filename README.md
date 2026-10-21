@@ -51,6 +51,39 @@ npm install @authrail/sdk-node
 The package exports compiled JavaScript and TypeScript declarations from
 `dist/`. This repository uses `npm ci` and `npm run build` for local development.
 
+## Discover and supply reviewed facts
+
+`discover` uses a tenant-issued, short-lived setup key to resolve an AI
+Inventory item and deployment. It does not issue a deployment credential or
+authorize an action. Keep the setup key in the protected application.
+
+`lookupStripeInvoiceStatus` reads the reviewed Stripe account and invoice;
+`lookupCustomerFact` accepts an application-owned read callback, and
+`newCustomerAPIReader` supplies a fixed HTTPS GET callback. Each returns an
+`ok`, `unavailable`, or `untrusted` fact resolution bound to the reviewed
+source, account, and lookup. Pass it as `factResolutions` on the Operation.
+Provider or customer API credentials remain in the protected application,
+outside the agent and sidecar. Configure all helpers from the exact reviewed
+Context Source Version, never from an agent-supplied URL or account.
+
+`extractContextFact` accepts bounded document bytes and a callback for the
+configured model. It checks the reviewed model, settings fingerprint,
+instructions version, one typed result, size, and uncertainty, then returns
+a signed fact resolution. The model supplies context, not a Rail decision.
+AuthRail receives bounded provenance and status, not the raw document or
+fact value. The callback must honor its abort signal; the SDK cannot forcibly
+stop an arbitrary callback that ignores cancellation.
+
+```ts
+const fact = await lookupCustomerFact(reviewedSource, invoice.id,
+  async (key, signal) => privateInvoiceLookup(key, { signal }));
+const checkedOperation = { ...operation, factResolutions: [fact] };
+```
+
+Use `traceparent` on an Operation only when it comes from the protected
+application's trace context. The sidecar forwards it for correlation; it
+does not prove caller identity, permission, or execution.
+
 ## Observe your first action
 
 Create one client in the protected application. Load the private key from your
@@ -201,6 +234,8 @@ record remains the source for reconciliation.
 ## Work on this SDK
 
 Run `npm ci`, `npm test`, and `npm pack --dry-run`. The public entry point is
-`src/index.ts`; Observe behavior, protocol encoding, and types live under
-`src/observe/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries and
+`src/index.ts`; the Enforce boundary lives under `src/enforce/`, while Observe
+behavior and shared protocol encoding live under `src/observe/`. The package
+also includes the current `conformance/v1` fixture corpus for adapter authors. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for boundaries and
 [CONTRIBUTING.md](CONTRIBUTING.md) for validation rules.

@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { ObserveClient } from './client.js';
-import type { ObservedCall } from './protocol.js';
-import { encodeInput, goJSON, jsonObject } from './protocol.js';
-import type { JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from './types.js';
+import { ObserveClient } from '../observe/client.js';
+import type { ObservedCall } from '../observe/protocol.js';
+import { encodeInput, goJSON, jsonObject } from '../observe/protocol.js';
+import type { JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
 
 /** A blocked Enforce check. A result-phase block cannot undo an earlier tool effect. */
 export class EnforceBlockedError extends Error {
@@ -88,12 +88,12 @@ export class EnforceClient {
   /** Resolves an uncertain attempt only after the executor has checked the provider by idempotency key. */
   async reconcile(input: { actionId: string; attemptId: string; permitId: string | null;
     inputSha256: string; providerIdempotencyKey: string;
-    providerReference: string; outcome: 'succeeded' | 'failed' }) {
+    providerReference: string; outcome: 'succeeded' | 'failed'; traceparent?: string }) {
     return this.#sidecar.reportExecution({ actionId: input.actionId,
       attemptId: input.attemptId, permitId: input.permitId,
       inputSha256: input.inputSha256,
       providerIdempotencyKey: input.providerIdempotencyKey,
-      providerReference: input.providerReference,
+      providerReference: input.providerReference, traceparent: input.traceparent,
       event: input.outcome === 'succeeded' ? 'reconciled_succeeded' : 'reconciled_failed' });
   }
 
@@ -103,7 +103,7 @@ export class EnforceClient {
     if (!decision.actionId) throw new EnforceBlockedError('tool_call', false, decision);
     const recovery = { actionId: decision.actionId, attemptId: call.requestId, permitId,
       inputSha256: createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex'),
-      providerIdempotencyKey: `ar-${decision.actionId}` };
+      providerIdempotencyKey: `ar-${decision.actionId}`, traceparent: call.traceparent };
     try {
       const started = await this.#sidecar.reportExecution({ ...recovery,
         event: 'started', providerReference: null });
@@ -124,8 +124,9 @@ export class EnforceClient {
       throw new EnforceOutcomeUnknownError(cause, recovery);
     }
     try {
-      await this.#sidecar.reportExecution({ ...recovery,
+      const completed = await this.#sidecar.reportExecution({ ...recovery,
         event: 'succeeded', providerReference: null });
+      if (completed.state !== 'succeeded') throw new Error('Completion was not retained as succeeded');
     } catch (cause) { throw new EnforceOutcomeUnknownError(cause, recovery); }
     let bounded = false;
     try { bounded = jsonObject(result) && Buffer.byteLength(goJSON(result)) <= 64 * 1024; }
@@ -144,7 +145,8 @@ export class EnforceClient {
 
 /** Persist this identity with the provider request so restart recovery can query its outcome. */
 export type ExecutionContext = { actionId: string; attemptId: string;
-  permitId: string | null; inputSha256: string; providerIdempotencyKey: string };
+  permitId: string | null; inputSha256: string; providerIdempotencyKey: string;
+  traceparent?: string };
 
 function permitted(decision: ObserveDecision): boolean {
   return decision.mode === 'enforce' && decision.enforced === false &&

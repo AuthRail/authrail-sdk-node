@@ -29,6 +29,7 @@ const outcomes = new Set([
   'indeterminate',
 ]);
 const coverage = new Set(['evaluated', 'uncovered', 'unavailable']);
+const traceparentPattern = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
 
 /** Sends advisory call and result checks to one loopback sidecar deployment. */
 export class ObserveClient {
@@ -159,6 +160,7 @@ export class ObserveClient {
         ? { factResolutions: operation.factResolutions } : {}),
       ...(operation.trajectory !== undefined ? { trajectory: operation.trajectory } : {}),
       ...(operation.reviewSummary !== undefined ? { reviewSummary: operation.reviewSummary } : {}),
+      ...(operation.traceparent !== undefined ? { traceparent: operation.traceparent } : {}),
       arguments: argumentsValue,
     });
     if (!uuid.test(snapshot.operationVersionId) || !reference.test(snapshot.actionKey) ||
@@ -167,7 +169,10 @@ export class ObserveClient {
         !reference.test(snapshot.resourceId)) || !jsonObject(snapshot.arguments) ||
       Buffer.byteLength(goJSON(snapshot.arguments)) > 64 * 1024 ||
       !['application_session', 'service_identity'].includes(snapshot.principalSource) ||
-      !['application_lookup', 'not_applicable'].includes(snapshot.resourceSource)) {
+      !['application_lookup', 'not_applicable'].includes(snapshot.resourceSource) ||
+      (snapshot.traceparent !== undefined &&
+        (!traceparentPattern.test(snapshot.traceparent) ||
+          /^00-0{32}-/.test(snapshot.traceparent) || /-0{16}-/.test(snapshot.traceparent)))) {
       throw new Error('Action contract is invalid');
     }
     if (snapshot.reviewSummary !== undefined && !validReviewSummary(snapshot.reviewSummary)) {
@@ -233,6 +238,7 @@ export class ObserveClient {
         Authorization: `Bearer ${this.#token}`,
         'Idempotency-Key': call.actionKey,
         'Content-Type': 'application/json',
+        ...(call.traceparent ? { traceparent: call.traceparent } : {}),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(2000),
@@ -291,7 +297,8 @@ export class ObserveClient {
     const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
     const response = await this.#fetch(new URL('/approval-permits/claim', this.#endpoint), {
       method: 'POST', redirect: 'manual',
-      headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json',
+        ...(call.traceparent ? { traceparent: call.traceparent } : {}) },
       body: JSON.stringify({ approvalRequestId: decision.approvalRequestId,
         actionId: decision.actionId, inputSha256, keySha256,
         proof: { issuedAt, expiresAt, signature } }),
@@ -315,7 +322,8 @@ export class ObserveClient {
   async reportExecution(input: { actionId: string; attemptId: string;
     permitId: string | null; event: 'started' | 'succeeded' | 'failed' | 'unknown' |
       'reconciled_succeeded' | 'reconciled_failed'; inputSha256: string;
-    providerIdempotencyKey: string; providerReference: string | null }): Promise<{
+    providerIdempotencyKey: string; providerReference: string | null;
+    traceparent?: string }): Promise<{
       receiptId: string; state: string; replayed: boolean }> {
     const publicKey = createPublicKey(this.#privateKey).export({ format: 'jwk' });
     if (typeof publicKey.x !== 'string') throw new Error('Executor key is invalid');
@@ -338,11 +346,19 @@ export class ObserveClient {
       ['expiresAt', goJSON(expiresAt)],
     ]);
     const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
+    if (input.traceparent && (!traceparentPattern.test(input.traceparent) ||
+      /^00-0{32}-/.test(input.traceparent) || /-0{16}-/.test(input.traceparent))) {
+      throw new Error('Trace context is invalid');
+    }
     const response = await this.#fetch(new URL('/execution-receipts', this.#endpoint), {
       method: 'POST', redirect: 'manual',
       headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json',
-        'Idempotency-Key': `${input.actionId}:${input.attemptId}:${input.event}` },
-      body: JSON.stringify({ ...input, keySha256,
+        'Idempotency-Key': `${input.actionId}:${input.attemptId}:${input.event}`,
+        ...(input.traceparent ? { traceparent: input.traceparent } : {}) },
+      body: JSON.stringify({ actionId: input.actionId, attemptId: input.attemptId,
+        permitId: input.permitId, event: input.event, inputSha256: input.inputSha256,
+        providerIdempotencyKey: input.providerIdempotencyKey,
+        providerReference: input.providerReference, keySha256,
         proof: { issuedAt, expiresAt, signature } }),
       signal: AbortSignal.timeout(3000),
     });
