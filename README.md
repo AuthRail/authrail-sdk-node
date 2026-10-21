@@ -181,6 +181,11 @@ return checked.result;
 The callback runs only after a covered `allow` decision and a signed `started`
 receipt have been retained by AuthRail. The SDK checks a successful result
 before returning it to the agent.
+The included [executable payment example](examples/enforce-payment.mjs) exercises
+this boundary against a configured test deployment with a mock provider ledger.
+It uses a fixed test action key; use a distinct stable business key per real
+payment, replace the fixed principal with authenticated application context,
+and keep the provider's own idempotency contract.
 It stops on denial, missing coverage, approval required, sidecar failure, or a
 report that has only been queued. An already retained call with the same action
 key also stops until the executor reconciles that Action. After a provider
