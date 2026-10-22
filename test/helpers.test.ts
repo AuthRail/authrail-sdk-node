@@ -76,6 +76,22 @@ test('Stripe lookup checks account and invoice; connected account sends reviewed
   assert.equal(wrongConnectedAccount.status, 'untrusted');
 });
 
+test('Stripe lookup stops after an expired account check even if the transport ignores abort', async () => {
+  let invoiceRequests = 0;
+  const result = await lookupStripeInvoiceStatus({ sourceVersionId,
+    providerAccountId: 'acct_123456789', timeoutMs: 100, secretKey: 'sk_test_secret',
+    fetch: async (url) => {
+      if (String(url).endsWith('/account')) {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        return new Response(JSON.stringify({ id: 'acct_123456789', object: 'account' }));
+      }
+      invoiceRequests++;
+      return new Response(JSON.stringify({ id: 'in_1234', object: 'invoice', status: 'paid' }));
+    } }, 'in_1234');
+  assert.equal(result.status, 'unavailable');
+  assert.equal(invoiceRequests, 0);
+});
+
 test('QuickBooks lookup binds reviewed realm and invoice and returns the Rail value shape', async () => {
   const source = { sourceVersionId, providerAccountId: '1234567890',
     timeoutMs: 500, accessToken: 'protected-oauth', sandbox: true,

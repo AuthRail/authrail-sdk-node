@@ -46,6 +46,7 @@ export async function lookupStripeInvoiceStatus(source: {
   };
   try {
     const accountValue = await request('account', !!source.connectedAccount);
+    if (controller.signal.aborted) return resolution;
     if (!accountValue || typeof accountValue !== 'object' || Array.isArray(accountValue) ||
       !('object' in accountValue) || accountValue.object !== 'account' ||
       !('id' in accountValue) || accountValue.id !== source.providerAccountId) {

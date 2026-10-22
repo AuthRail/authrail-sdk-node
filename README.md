@@ -72,6 +72,17 @@ refresh token or create a QuickBooks connection. `Balance` is in the invoice's
 currency; this source contract does not pin a currency, so a numeric threshold
 must not be presented as currency-qualified without another reviewed source.
 
+The protected application owns QuickBooks consent and the OAuth callback. Bind
+the returned realm ID to the reviewed account before storing tokens in its
+own encrypted, access-controlled credential store. Refresh before a read when
+needed, serialize refresh per realm, and persist the newest access and refresh
+tokens together before using them; an expired, revoked, or mismatched grant
+must yield unavailable context and require reconnection. Do not pass tokens,
+OAuth codes, or provider response bodies to the agent, sidecar, or AuthRail.
+Stripe keys likewise stay in that store and must be scoped to the reviewed
+account. The SDK accepts an application-supplied access token for one bounded
+read; it does not perform consent, persist tokens, or retry an effect.
+
 `lookupCustomerFact` accepts an application-owned read callback, and
 `newCustomerAPIReader` supplies a fixed HTTPS GET callback. Each returns an
 `ok`, `unavailable`, or `untrusted` fact resolution bound to the reviewed
@@ -83,7 +94,8 @@ Context Source Version, never from an agent-supplied URL or account.
 `extractContextFact` accepts bounded document bytes and a callback for the
 configured model. It checks the reviewed model, settings fingerprint,
 instructions version, one typed result, size, and uncertainty, then returns
-a signed fact resolution. The model supplies context, not a Rail decision.
+a fact resolution. The protected executor signs it as part of the Operation
+sent to the sidecar. The model supplies context, not a Rail decision.
 AuthRail receives bounded provenance and status, not the raw document or
 fact value. The callback must honor its abort signal; the SDK cannot forcibly
 stop an arbitrary callback that ignores cancellation.
@@ -229,6 +241,20 @@ this boundary against a configured test deployment with a mock provider ledger.
 It uses a fixed test action key; use a distinct stable business key per real
 payment, replace the fixed principal with authenticated application context,
 and keep the provider's own idempotency contract.
+For a model-driven attempt, run [the OpenAI Responses example](examples/agent-enforce-payment.mjs)
+from the credential-owning application. Set `OPENAI_API_KEY`, `OPENAI_MODEL`,
+`AUTHRAIL_AGENT_PROMPT`, `AUTHRAIL_ACTION_KEY`, `AUTHRAIL_PRINCIPAL_ID`,
+`AUTHRAIL_SESSION_ID`, `AUTHRAIL_OPERATION_VERSION_ID`, and the sidecar and
+executor settings used by the payment example. The application must derive the
+principal and session from its authenticated caller and supply a distinct,
+stable action key for each business payment. The model receives one mock payment
+tool; the protected callback runs only through `EnforceClient`. The script prints
+one JSON summary of the attempted call, decision, receipt-backed result, and
+mock effect count. A request for 150 mock units reaches the Rail so it can be
+denied there; a request for 80 can be allowed by the reviewed example Rail.
+It never makes a Stripe payment. Its in-memory mock ledger is
+only a local demonstration; a real provider adapter must persist or query the
+provider idempotency key when recovering an uncertain outcome.
 It stops on denial, missing coverage, approval required, sidecar failure, or a
 report that has only been queued. An already retained call with the same action
 key also stops until the executor reconciles that Action. After a provider
