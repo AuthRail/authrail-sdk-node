@@ -88,6 +88,27 @@ export type Observation = {
   resultError: unknown;
 };
 
+/** Application-owned, version-pinned processing at a protected string boundary. */
+export type GuardHandler = {
+  id: string;
+  version: string;
+  kind: 'sanitize' | 'transform';
+  /** Pure string processing; rejection, invalid output, or a four-second deadline blocks the boundary. */
+  process: (value: string) => string | Promise<string>;
+};
+
+/** Signed processing assertion; it does not independently prove the registered handler's code. */
+export type GuardEvidence = {
+  phase: 'tool_call' | 'tool_result';
+  bundleId: string;
+  kind: 'sanitize' | 'transform';
+  handlerId: string;
+  handlerVersion: string;
+  target: { root: 'arguments' | 'result'; path: string[] };
+  inputSha256: string;
+  outputSha256: string;
+};
+
 /** Local sidecar connection and application signing key; never supply a deployment credential. */
 export type ObserveClientConfig = {
   sidecarUrl: string;
@@ -96,4 +117,16 @@ export type ObserveClientConfig = {
   deploymentId: string;
   executorPrivateKey: string | KeyObject;
   fetch?: typeof globalThis.fetch;
+  /** Enforce runs exact matching handlers; Observe never processes inputs or results. */
+  guardHandlers?: GuardHandler[];
 };
+
+/** Explicit executor knowledge of an advisory attempt; exceptions alone do not prove failure. */
+export type ObservedExecutionOutcome = {
+  event: 'succeeded' | 'failed' | 'unknown' | 'reconciled_succeeded' | 'reconciled_failed';
+  providerIdempotencyKey: string;
+  providerReference: string | null;
+};
+
+export type ObservedExecutionRecording = { recordingStatus: 'retained' | 'queued';
+  receiptId?: string; actionId?: string; state?: string; replayed?: boolean };

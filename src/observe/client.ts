@@ -15,6 +15,8 @@ import type {
   ObserveClientConfig,
   ObserveDecision,
   ObserveOperation,
+  ObservedExecutionOutcome,
+  ObservedExecutionRecording,
 } from './types.js';
 
 type Checked = { decision: ObserveDecision | null; error: unknown };
@@ -77,7 +79,7 @@ export class ObserveClient {
     operation: ObserveOperation,
     argumentsValue: JSONObject,
     execute: () => Result | Promise<Result>,
-  ): { result: Promise<Result>; observation: Promise<Observation> } {
+  ): { result: Promise<Result>; observation: Promise<Observation>; call: ObservedCall | undefined } {
     if (typeof execute !== 'function') throw new Error('Protected tool function is required');
     let call: ObservedCall | undefined;
     let callCheck: Promise<Checked>;
@@ -143,7 +145,7 @@ export class ObserveClient {
         };
       },
     );
-    return { result, observation };
+    return { result, observation, call };
   }
 
   /** Prepare one immutable action before a protected call; reused for the result phase. */
@@ -178,7 +180,21 @@ export class ObserveClient {
     if (snapshot.reviewSummary !== undefined && !validReviewSummary(snapshot.reviewSummary)) {
       throw new Error('Review summary is invalid');
     }
-    return { ...snapshot, requestId: randomUUID() };
+    return Object.freeze({ ...snapshot, requestId: randomUUID() });
+  }
+
+  /** Read the active bundle's processing requirements; this never authorizes an action. */
+  async guardRequirements(operationVersionId: string, phase: Phase): Promise<unknown> {
+    if (!uuid.test(operationVersionId) || !['tool_call', 'tool_result'].includes(phase)) {
+      throw new Error('Guard requirements request is invalid');
+    }
+    const endpoint = new URL('/guard-requirements', this.#endpoint);
+    endpoint.searchParams.set('operationVersionId', operationVersionId);
+    endpoint.searchParams.set('phase', phase);
+    const response = await this.#fetch(endpoint, { method: 'GET', redirect: 'manual',
+      headers: { Authorization: `Bearer ${this.#token}` }, signal: AbortSignal.timeout(4000) });
+    if (response.status !== 200) throw new Error(`Sidecar returned HTTP ${response.status}`);
+    return boundedJSON(response);
   }
 
   /** Signs one phase; callers enforcing a decision must apply the outcome themselves. */
@@ -227,6 +243,7 @@ export class ObserveClient {
       ...(phase === 'tool_result' ? { result } : {}),
       ...(call.factResolutions?.length ? { factResolutions: call.factResolutions } : {}),
       ...(call.trajectory ? { trajectory: call.trajectory } : {}),
+      ...(call.guardEvidence?.length ? { guardEvidence: call.guardEvidence } : {}),
       attribution,
       ...(reviewSummarySha256 ? { reviewSummary: call.reviewSummary } : {}),
       identityProof: { issuedAt, expiresAt, signature },
@@ -241,7 +258,7 @@ export class ObserveClient {
         ...(call.traceparent ? { traceparent: call.traceparent } : {}),
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(expectedMode === 'enforce' ? 4000 : 2000),
     });
     if (response.status !== 200) throw new Error(`Sidecar returned HTTP ${response.status}`);
     const decision = await boundedJSON(response);
@@ -271,6 +288,17 @@ export class ObserveClient {
   /** Claims an approved Action once. An uncertain response must be reconciled, never retried blindly. */
   async claimApproval(call: ObservedCall, decision: ObserveDecision): Promise<{
     permitId: string; actionId: string; expiresAt: string }> {
+    return this.#approvalPermit(call, decision, false);
+  }
+
+  /** Reads an exact existing unstarted permit after an uncertain claim response. */
+  async recoverApprovalPermit(call: ObservedCall, decision: ObserveDecision): Promise<{
+    permitId: string; actionId: string; expiresAt: string }> {
+    return this.#approvalPermit(call, decision, true);
+  }
+
+  async #approvalPermit(call: ObservedCall, decision: ObserveDecision,
+    recoverExisting: boolean): Promise<{ permitId: string; actionId: string; expiresAt: string }> {
     if (decision.mode !== 'enforce' || decision.outcome !== 'approval_required' ||
       decision.recordingStatus !== 'retained' || decision.reportReplayed !== false ||
       !decision.actionId || !uuid.test(decision.actionId) ||
@@ -295,7 +323,8 @@ export class ObserveClient {
       ['expiresAt', goJSON(expiresAt)],
     ]);
     const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
-    const response = await this.#fetch(new URL('/approval-permits/claim', this.#endpoint), {
+    const response = await this.#fetch(new URL(recoverExisting
+      ? '/approval-permits/recover' : '/approval-permits/claim', this.#endpoint), {
       method: 'POST', redirect: 'manual',
       headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json',
         ...(call.traceparent ? { traceparent: call.traceparent } : {}) },
@@ -304,7 +333,9 @@ export class ObserveClient {
         proof: { issuedAt, expiresAt, signature } }),
       signal: AbortSignal.timeout(3000),
     });
-    if (response.status !== 201) throw new Error(`Approval claim returned HTTP ${response.status}`);
+    if (response.status !== (recoverExisting ? 200 : 201)) {
+      throw new Error(`Approval permit returned HTTP ${response.status}`);
+    }
     const permit = await boundedJSON(response);
     if (!permit || typeof permit !== 'object' || Array.isArray(permit) ||
       !('permitId' in permit) || typeof permit.permitId !== 'string' ||
@@ -316,6 +347,53 @@ export class ObserveClient {
       throw new Error('Approval permit response is invalid');
     }
     return permit as { permitId: string; actionId: string; expiresAt: string };
+  }
+
+  /** Reports explicit executor knowledge after an Observe attempt. Never pauses or authorizes the tool. */
+  async reportObservedExecution(call: ObservedCall, outcome: ObservedExecutionOutcome): Promise<ObservedExecutionRecording> {
+    if (!uuid.test(call.requestId) || !uuid.test(call.operationVersionId) || !reference.test(call.actionKey) ||
+      !['succeeded', 'failed', 'unknown', 'reconciled_succeeded', 'reconciled_failed'].includes(outcome.event) ||
+      typeof outcome.providerIdempotencyKey !== 'string' || !reference.test(outcome.providerIdempotencyKey) ||
+      (outcome.providerReference !== null && (typeof outcome.providerReference !== 'string' || !reference.test(outcome.providerReference))) ||
+      (outcome.event.startsWith('reconciled_') && outcome.providerReference === null)) {
+      throw new Error('Observed execution outcome is invalid');
+    }
+    const inputSha256 = createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex');
+    const publicKey = createPublicKey(this.#privateKey).export({ format: 'jwk' });
+    if (typeof publicKey.x !== 'string') throw new Error('Executor key is invalid');
+    const keySha256 = createHash('sha256').update(Buffer.from(publicKey.x, 'base64url')).digest('hex');
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const expiresAt = issuedAt + 30;
+    const statement = fields([
+      ['type', goJSON('authrail.execution.receipt.observe.v1')], ['organisationId', goJSON(this.#organisationId)],
+      ['deploymentId', goJSON(this.#deploymentId)], ['operationVersionId', goJSON(call.operationVersionId)],
+      ['actionKey', goJSON(call.actionKey)], ['attemptId', goJSON(call.requestId)], ['event', goJSON(outcome.event)],
+      ['inputSha256', goJSON(inputSha256)], ['providerIdempotencyKey', goJSON(outcome.providerIdempotencyKey)],
+      ['providerReference', goJSON(outcome.providerReference)], ['keySha256', goJSON(keySha256)],
+      ['issuedAt', goJSON(issuedAt)], ['expiresAt', goJSON(expiresAt)],
+    ]);
+    const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
+    const response = await this.#fetch(new URL('/execution/observed-receipts', this.#endpoint), {
+      method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(2000),
+      headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json',
+        'Idempotency-Key': `${call.operationVersionId}:${call.actionKey}:${call.requestId}:${outcome.event}`,
+        ...(call.traceparent ? { traceparent: call.traceparent } : {}) },
+      body: JSON.stringify({ operationVersionId: call.operationVersionId, actionKey: call.actionKey,
+        attemptId: call.requestId, event: outcome.event, inputSha256,
+        providerIdempotencyKey: outcome.providerIdempotencyKey, providerReference: outcome.providerReference,
+        keySha256, proof: { issuedAt, expiresAt, signature } }),
+    });
+    if (response.status !== 201 && response.status !== 202) throw new Error('Observed outcome could not be recorded');
+    const value = await boundedJSON(response);
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !('recordingStatus' in value)) {
+      throw new Error('Observed outcome response is invalid');
+    }
+    if (response.status === 202 && value.recordingStatus === 'queued') return { recordingStatus: 'queued' };
+    if (value.recordingStatus !== 'retained' || !('actionId' in value) || typeof value.actionId !== 'string' || !uuid.test(value.actionId) ||
+      !('receiptId' in value) || typeof value.receiptId !== 'string' || !uuid.test(value.receiptId) ||
+      !('state' in value) || !['succeeded', 'failed', 'outcome_unknown'].includes(String(value.state)) ||
+      !('replayed' in value) || typeof value.replayed !== 'boolean') throw new Error('Observed outcome response is invalid');
+    return value as ObservedExecutionRecording;
   }
 
   /** Signs one executor assertion; only the protected application can know the provider outcome. */

@@ -4,8 +4,8 @@ import { createHash, generateKeyPairSync, randomUUID, verify } from 'node:crypto
 import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { EnforceBlockedError, EnforceClient, EnforceOutcomeUnknownError, ObserveClient } from '../src/index.js';
-import type { ObserveOperation } from '../src/index.js';
-import { encodeInput } from '../src/observe/protocol.js';
+import type { GuardEvidence, GuardHandler, ObserveOperation } from '../src/index.js';
+import { encodeInput, goJSON } from '../src/observe/protocol.js';
 import type { ObservedCall } from '../src/observe/protocol.js';
 
 type RequestBody = {
@@ -107,11 +107,12 @@ test('shared canonical input vectors match the signed Node bytes', () => {
     cases: Array<{ name: string; phase: 'tool_call' | 'tool_result';
       arguments: Record<string, string | number>; result?: Record<string, string>;
       factResolutions?: ObservedCall['factResolutions'];
-      trajectory?: ObservedCall['trajectory']; canonicalInput: string }> };
+      trajectory?: ObservedCall['trajectory']; guardEvidence?: GuardEvidence[]; canonicalInput: string }> };
   assert.equal(corpus.formatVersion, 1);
   for (const fixture of corpus.cases) {
     const call = { ...operation(), requestId: randomUUID(), arguments: fixture.arguments,
-      factResolutions: fixture.factResolutions, trajectory: fixture.trajectory } as ObservedCall;
+      factResolutions: fixture.factResolutions, trajectory: fixture.trajectory,
+      guardEvidence: fixture.guardEvidence } as ObservedCall;
     assert.equal(encodeInput(call, fixture.phase, fixture.result),
       fixture.canonicalInput, fixture.name);
   }
@@ -359,7 +360,7 @@ test('approval resumes the original call only after a one-use claim', async () =
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated', outcome: body.phase === 'tool_call'
         ? 'approval_required' : 'allow', recordingStatus: 'retained', reportReplayed: false,
-      ...(body.phase === 'tool_call' ? { actionId, approvalRequestId } : {}) }),
+      actionId, ...(body.phase === 'tool_call' ? { approvalRequestId } : {}) }),
     { status: 200 });
   });
   let blocked: EnforceBlockedError | undefined;
@@ -379,6 +380,46 @@ test('approval resumes the original call only after a one-use claim', async () =
   assert.deepEqual(requests, ['/evaluate', '/approval-permits/claim',
     '/execution-receipts', '/execution-receipts', '/evaluate']);
   await assert.rejects(adapter.resumeApproval(blocked), EnforceBlockedError);
+  assert.equal(effects, 1);
+});
+
+test('approval continuation accepts a retained result for the same approved Action', async () => {
+  const approvalRequestId = randomUUID();
+  const permitId = randomUUID();
+  let claims = 0;
+  let effects = 0;
+  const provider = async (url: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    if (path === '/approval-permits/claim') {
+      claims++;
+      return new Response(JSON.stringify({ permitId, actionId,
+        expiresAt: new Date(Date.now() + 20_000).toISOString() }), { status: 201 });
+    }
+    if (path === '/execution-receipts') return receiptResponse(init);
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated',
+      outcome: 'approval_required',
+      recordingStatus: 'retained', reportReplayed: false,
+      actionId, ...(body.phase === 'tool_call' ? { approvalRequestId } : {}) }),
+    { status: 200 });
+  };
+  let continuation;
+  try { await enforceClient(provider).enforce(operation(), { amount: 400 },
+    () => { effects++; return { paid: true }; }); }
+  catch (error) {
+    if (!(error instanceof EnforceBlockedError)) throw error;
+    continuation = error.approvalContinuation;
+  }
+  assert.ok(continuation);
+  assert.equal(effects, 0);
+  const stored = JSON.parse(JSON.stringify(continuation)) as typeof continuation;
+  const resumed = await enforceClient(provider).resumeApprovalFrom(stored, () => {
+    effects++;
+    return { paid: true };
+  });
+  assert.equal(resumed.permitId, permitId);
+  assert.equal(claims, 1);
   assert.equal(effects, 1);
 });
 
@@ -404,6 +445,51 @@ test('an uncertain approval claim never runs or retries the protected callback',
   await assert.rejects(adapter.resumeApproval(blocked), EnforceBlockedError);
   assert.equal(claims, 1);
   assert.equal(effects, 0);
+});
+
+test('lost approval claim response resumes only through an exact existing permit read', async () => {
+  const approvalRequestId = randomUUID();
+  const permitId = randomUUID();
+  let claims = 0;
+  let reads = 0;
+  let effects = 0;
+  const provider = async (url: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    if (path === '/approval-permits/claim') {
+      claims++;
+      throw new Error('claim acknowledgement lost');
+    }
+    if (path === '/approval-permits/recover') {
+      reads++;
+      return new Response(JSON.stringify({ permitId, actionId,
+        expiresAt: new Date(Date.now() + 20_000).toISOString() }), { status: 200 });
+    }
+    if (path === '/execution-receipts') return receiptResponse(init);
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated',
+      outcome: body.phase === 'tool_call' ? 'approval_required' : 'allow',
+      recordingStatus: 'retained', reportReplayed: false,
+      actionId, ...(body.phase === 'tool_call' ? { approvalRequestId } : {}) }),
+    { status: 200 });
+  };
+  let continuation;
+  try { await enforceClient(provider).enforce(operation(), { amount: 400 },
+    () => { effects++; return { paid: true }; }); }
+  catch (error) {
+    if (!(error instanceof EnforceBlockedError)) throw error;
+    continuation = error.approvalContinuation;
+  }
+  assert.ok(continuation);
+  await assert.rejects(enforceClient(provider).resumeApprovalFrom(continuation,
+    () => { effects++; return { paid: true }; }), EnforceBlockedError);
+  assert.equal(effects, 0);
+  const resumed = await enforceClient(provider).recoverApprovalFrom(continuation,
+    () => { effects++; return { paid: true }; });
+  assert.equal(resumed.permitId, permitId);
+  assert.equal(claims, 1);
+  assert.equal(reads, 1);
+  assert.equal(effects, 1);
 });
 
 function expectedStatement(body: RequestBody, inputSha256: string) {
@@ -694,4 +780,181 @@ test('real loopback HTTP sends authenticated, signed call and result requests', 
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+
+const guardBundleId = '00000000-0000-4000-8000-000000000099';
+const guardVersion = 'a'.repeat(64);
+function guardRequirement(phase: 'tool_call' | 'tool_result') {
+  return { railVersionId: randomUUID(), ruleId: 'redact', kind: 'sanitize',
+    handlerId: 'redact', handlerVersion: guardVersion,
+    target: { root: phase === 'tool_call' ? 'arguments' : 'result', path: ['text'] } };
+}
+function guardPlan(phase: 'tool_call' | 'tool_result', requirements = [guardRequirement(phase)]) {
+  return { formatVersion: 1, operationVersionId, phase, bundleId: guardBundleId,
+    sequence: 1, coverage: 'evaluated', requirements };
+}
+function processingClient(fetchImpl: typeof fetch, handlers: GuardHandler[]) {
+  return new EnforceClient({ sidecarUrl: 'http://127.0.0.1:7078', adapterToken,
+    organisationId, deploymentId, executorPrivateKey: keys.privateKey,
+    fetch: fetchImpl, guardHandlers: handlers });
+}
+const hashString = (value: string) => createHash('sha256').update(goJSON(value)).digest('hex');
+
+// Security risk: processing must be exact-version, signed, mutation-safe, and retained across both hooks.
+test('Guard handlers process copies once and sign call and result evidence', async () => {
+  const evaluated: Array<{ phase: string; arguments: { text: string }; result?: { text: string };
+    guardEvidence: GuardEvidence[] }> = [];
+  const receipts: string[] = [];
+  let processed = 0;
+  const adapter = processingClient(async (url, init) => {
+    const endpoint = new URL(String(url));
+    if (endpoint.pathname === '/guard-requirements') {
+      assert.equal(new Headers(init?.headers).get('Authorization'), `Bearer ${adapterToken}`);
+      const phase = endpoint.searchParams.get('phase') as 'tool_call' | 'tool_result';
+      const requirement = guardRequirement(phase);
+      return new Response(JSON.stringify(guardPlan(phase, [requirement, { ...requirement, railVersionId: randomUUID() }])));
+    }
+    if (endpoint.pathname === '/execution-receipts') return receiptResponse(init, receipts);
+    const body = requestBody(init) as RequestBody & (typeof evaluated)[number];
+    evaluated.push(body);
+    const canonical = encodeInput({ ...operation(), requestId: body.requestId,
+      arguments: body.arguments, guardEvidence: body.guardEvidence }, body.phase, body.result);
+    assert.equal(verify(null, Buffer.from(expectedStatement(body,
+      createHash('sha256').update(canonical).digest('hex'))), keys.publicKey,
+      Buffer.from(body.identityProof.signature, 'base64url')), true);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: guardBundleId,
+      recordingStatus: 'retained', reportReplayed: false, actionId }));
+  }, [{ id: 'redact', version: guardVersion, kind: 'sanitize', process: (text) => {
+    processed++; return text.replace('secret', '[redacted]');
+  } }]);
+  const original = { text: '<secret>' }, originalResult = { text: 'secret output' };
+  const checked = await adapter.enforce(operation(), original, (args) => {
+    assert.deepEqual(args, { text: '<[redacted]>' }); return originalResult;
+  });
+  assert.deepEqual(original, { text: '<secret>' });
+  assert.deepEqual(originalResult, { text: 'secret output' });
+  assert.deepEqual(checked.result, { text: '[redacted] output' });
+  assert.equal(processed, 2);
+  assert.deepEqual(receipts, ['started', 'succeeded']);
+  assert.equal(evaluated[0]!.guardEvidence.length, 1);
+  assert.deepEqual(evaluated[1]!.guardEvidence[0], evaluated[0]!.guardEvidence[0]);
+  assert.equal(evaluated[1]!.guardEvidence.length, 2);
+  assert.equal(evaluated[0]!.guardEvidence[0]!.inputSha256, hashString('<secret>'));
+  assert.equal(evaluated[0]!.guardEvidence[0]!.outputSha256, hashString('<[redacted]>'));
+});
+
+// Security risk: unavailable plans, unregistered versions, isolation, and conflicting targets must never run effects.
+test('Guard processing blocks unavailable, mismatched, and conflicting plans before execution', async () => {
+  for (const failure of ['unavailable', 'version', 'overlap', 'isolate', 'bundle', 'prototype']) {
+    let effects = 0;
+    const adapter = processingClient(async (url, init) => {
+      const endpoint = new URL(String(url));
+      if (endpoint.pathname === '/guard-requirements') {
+        if (failure === 'unavailable') return new Response('', { status: 503 });
+        const requirement = guardRequirement('tool_call');
+        if (failure === 'version') requirement.handlerVersion = 'b'.repeat(64);
+        if (failure === 'isolate') requirement.kind = 'isolate';
+        if (failure === 'prototype') requirement.target.path = ['constructor'];
+        const requirements = [requirement];
+        if (failure === 'overlap') requirements.push({ ...requirement, handlerId: 'other' });
+        return new Response(JSON.stringify(guardPlan('tool_call', requirements)));
+      }
+      if (endpoint.pathname === '/execution-receipts') return receiptResponse(init);
+      const body = requestBody(init);
+      return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+        enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: randomUUID(),
+        recordingStatus: 'retained', reportReplayed: false, actionId }));
+    }, [{ id: 'redact', version: guardVersion, kind: 'sanitize', process: (text) => text }]);
+    await assert.rejects(adapter.enforce(operation(), { text: 'secret' }, () => {
+      effects++; return { text: 'result' };
+    }), (error) => error instanceof EnforceBlockedError && error.phase === 'tool_call', failure);
+    assert.equal(effects, 0, failure);
+  }
+});
+
+// Security risk: a result processor failure must not expose the already-executed tool's result.
+test('Guard result handler failures withhold the result after the effect', async () => {
+  let effects = 0;
+  const phases: string[] = [];
+  const adapter = processingClient(async (url, init) => {
+    const endpoint = new URL(String(url));
+    if (endpoint.pathname === '/guard-requirements') {
+      const phase = endpoint.searchParams.get('phase') as 'tool_call' | 'tool_result';
+      return new Response(JSON.stringify(guardPlan(phase, phase === 'tool_call' ? [] : [guardRequirement(phase)])));
+    }
+    if (endpoint.pathname === '/execution-receipts') return receiptResponse(init);
+    const body = requestBody(init); phases.push(body.phase);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: guardBundleId,
+      recordingStatus: 'retained', reportReplayed: false, actionId }));
+  }, [{ id: 'redact', version: guardVersion, kind: 'sanitize', process: () => { throw new Error('failed'); } }]);
+  await assert.rejects(adapter.enforce(operation(), {}, () => { effects++; return { text: 'secret' }; }),
+    (error) => error instanceof EnforceBlockedError && error.phase === 'tool_result' && error.effectMayHaveOccurred);
+  assert.equal(effects, 1);
+  assert.deepEqual(phases, ['tool_call']);
+});
+
+// Security risk: resuming approval must execute the already-approved processed bytes without rerunning handlers.
+test('Guard approval continuations retain processed input without rerunning the call handler', async () => {
+  let processed = 0, effects = 0;
+  const approvalRequestId = randomUUID(), permitId = randomUUID();
+  const provider: typeof fetch = async (url, init) => {
+    const endpoint = new URL(String(url));
+    if (endpoint.pathname === '/guard-requirements') {
+      const phase = endpoint.searchParams.get('phase') as 'tool_call' | 'tool_result';
+      return new Response(JSON.stringify(guardPlan(phase, phase === 'tool_call' ? [guardRequirement(phase)] : [])));
+    }
+    if (endpoint.pathname === '/approval-permits/claim') {
+      return new Response(JSON.stringify({ permitId, actionId,
+        expiresAt: new Date(Date.now() + 20_000).toISOString() }), { status: 201 });
+    }
+    if (endpoint.pathname === '/execution-receipts') return receiptResponse(init);
+    const body = requestBody(init);
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'approval_required', bundleId: guardBundleId,
+      recordingStatus: 'retained', reportReplayed: false, actionId,
+      ...(body.phase === 'tool_call' ? { approvalRequestId } : {}) }));
+  };
+  const handlers: GuardHandler[] = [{ id: 'redact', version: guardVersion, kind: 'sanitize',
+    process: () => { processed++; return 'approved text'; } }];
+  let continuation;
+  try { await processingClient(provider, handlers).enforce(operation(), { text: 'secret' }, () => {
+    effects++; return {};
+  }); } catch (error) {
+    if (!(error instanceof EnforceBlockedError)) throw error;
+    continuation = error.approvalContinuation;
+  }
+  assert.ok(continuation);
+  const stored = JSON.parse(JSON.stringify(continuation)) as typeof continuation;
+  await processingClient(provider, handlers).resumeApprovalFrom(stored, (args) => {
+    assert.deepEqual(args, { text: 'approved text' }); effects++; return {};
+  });
+  assert.equal(processed, 1); assert.equal(effects, 1);
+});
+
+test('observed execution evidence signs the original attempt and never requests a permit', async () => {
+  let sends = 0;
+  const sdk = client(async (url, init) => {
+    sends++;
+    assert.equal(new URL(String(url)).pathname, '/execution/observed-receipts');
+    const body = JSON.parse(String(init?.body));
+    assert.equal(body.attemptId, call.requestId);
+    assert.equal(body.inputSha256, createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex'));
+    assert.equal(body.permitId, undefined);
+    assert.equal(body.arguments, undefined);
+    const statement = JSON.stringify({ type: 'authrail.execution.receipt.observe.v1', organisationId, deploymentId,
+      operationVersionId: body.operationVersionId, actionKey: body.actionKey, attemptId: body.attemptId,
+      event: body.event, inputSha256: body.inputSha256, providerIdempotencyKey: body.providerIdempotencyKey,
+      providerReference: body.providerReference, keySha256: body.keySha256,
+      issuedAt: body.proof.issuedAt, expiresAt: body.proof.expiresAt });
+    assert.equal(verify(null, Buffer.from(statement), keys.publicKey, Buffer.from(body.proof.signature, 'base64url')), true);
+    assert.equal(verify(null, Buffer.from(statement.replace('succeeded', 'failed')), keys.publicKey, Buffer.from(body.proof.signature, 'base64url')), false);
+    return new Response(JSON.stringify({ recordingStatus: 'queued' }), { status: 202 });
+  });
+  const call = sdk.prepare(operation(), { amount: 80, invoiceId: 'invoice_123' });
+  assert.deepEqual(await sdk.reportObservedExecution(call, { event: 'succeeded', providerIdempotencyKey: 'business-effect', providerReference: 'record_123' }), { recordingStatus: 'queued' });
+  await assert.rejects(() => sdk.reportObservedExecution(call, { event: 'reconciled_succeeded', providerIdempotencyKey: 'business-effect', providerReference: null }));
+  assert.equal(sends, 1);
 });

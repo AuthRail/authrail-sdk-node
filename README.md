@@ -233,6 +233,32 @@ const checked = await authrail.enforce(operation, { invoiceId: invoice.id },
 return checked.result;
 ```
 
+For a published Guard that requires string processing, register the exact
+application-owned handler before calling Enforce:
+
+```ts
+const authrail = new EnforceClient({ ...config, guardHandlers: [{
+  id: "customer_redactor",
+  version: reviewedRedactorSha256,
+  kind: "sanitize",
+  process: redactCustomerText,
+}] });
+```
+
+The handler ID, lowercase SHA-256 version, and kind must match the reviewed
+Guard. Use deterministic, side-effect-free string handlers. Enforce reads the
+current requirements from the authenticated local sidecar, processes copies of
+only the reviewed string fields, and signs their before/after digests with the
+final decision input. It checks transformed results before exposing them.
+Unavailable plans, missing handlers, conflicting targets, handler failures,
+and unsupported isolation block the boundary. A handler has four seconds to
+complete; a timed-out Promise may continue in the application, so handlers must
+not perform business effects. Call processing is not repeated when resuming an
+approved continuation. Observe never runs these handlers. Without configured
+handlers, existing calls use the normal evaluation path; the sidecar blocks any
+unfulfilled Guard requirement. A signed handler assertion does not independently
+verify the handler's implementation or prove sandbox isolation.
+
 The callback runs only after a covered `allow` decision and a signed `started`
 receipt have been retained by AuthRail. The SDK checks a successful result
 before returning it to the agent.
@@ -286,12 +312,21 @@ needs to decide. Never put raw tool payloads, credentials, or sensitive content
 there. The protected application signs the summary digest; AuthRail lists it
 only for named reviewers in Rails → Approvals for you. Without a valid summary,
 approval remains unavailable. After a named reviewer approves, call
-`authrail.resumeApproval(blockedError)` on the **same** client instance. It
-claims the original Action once through the sidecar, runs the original protected
-callback, and checks the result before exposure. A lost or rejected claim does
-not run the callback and cannot be retried through the same error. Reconcile the
-Action before taking another step. Process loss also requires reconciliation;
-the SDK does not persist the pending callback or claim state.
+`authrail.resumeApproval(blockedError)` on the same client instance. For a
+workflow that crosses requests or restarts, encrypt and retain
+`blockedError.approvalContinuation` in protected application storage, scoped to
+the original user, organisation, deployment, Action, and business request.
+On approval, a new client may call `resumeApprovalFrom(continuation, callback)`
+with the original protected callback. Do not obtain fresh model arguments or
+create a new Action for that continuation. Both paths claim the original Action
+through the sidecar before the callback and check the result before exposure.
+A Policy may still report `approval_required` at the result hook because it
+evaluates the same business arguments. The SDK releases that retained result
+only when the original Action has a claimed permit and the result belongs to
+that exact Action. A result denial, missing report, or different Action blocks
+exposure even after the mock or provider effect ran.
+A lost or rejected permit claim never runs the callback; inspect the Action
+before another claim. The SDK does not persist a continuation for the caller.
 
 If the signed Enforce bundle expires or becomes unavailable, protected calls
 stop. A tenant manager can switch the deployment back to Observe, renew the
@@ -313,3 +348,23 @@ behavior and shared protocol encoding live under `src/observe/`. The package
 also includes the current `conformance/v1` fixture corpus for adapter authors. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries and
 [CONTRIBUTING.md](CONTRIBUTING.md) for validation rules.
+
+
+### Report execution outcomes while observing
+
+Observe decisions stay advisory. To retain what the executor actually did,
+keep the original `call` returned by `observe` and pass explicit executor
+knowledge to `reportObservedExecution(call, outcome)`. The outcome has `event`
+(`succeeded`, `failed`, `unknown`, `reconciled_succeeded`, or `reconciled_failed`),
+the executor's `providerIdempotencyKey`, and a bounded `providerReference` or
+`null`. Use `unknown` when an exception or pending provider response cannot
+establish whether an effect happened. A successful rule check is never an
+execution outcome. Do not run a business operation again to retry a report.
+
+The method sends signed digests and references only. `recordingStatus: queued`
+means the local sidecar persisted delivery; `retained` includes the central
+Action and receipt IDs. Outcome reporting never requests permission, changes
+an advisory deny, or delays the tool callback. Read observation separately for
+call/result check failures; classify the business outcome from the executor's
+own evidence. The original prepared call must be retained until reporting is
+acknowledged. See the sidecar protocol for historical signature verification.

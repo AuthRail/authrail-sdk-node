@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { ObserveClient } from '../observe/client.js';
 import type { ObservedCall } from '../observe/protocol.js';
 import { encodeInput, goJSON, jsonObject } from '../observe/protocol.js';
-import type { JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
+import { processGuard, registeredHandlers } from './guard.js';
+import type { GuardHandler, JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
 
 /** A blocked Enforce check. A result-phase block cannot undo an earlier tool effect. */
 export class EnforceBlockedError extends Error {
@@ -11,11 +12,19 @@ export class EnforceBlockedError extends Error {
     readonly effectMayHaveOccurred: boolean,
     readonly decision: ObserveDecision | null,
     cause?: unknown,
+    /** Persist only in protected application storage for a later approved retry. */
+    readonly approvalContinuation?: ApprovalContinuation,
   ) {
     super(`AuthRail blocked the ${phase === 'tool_call' ? 'tool call' : 'tool result'}`, { cause });
     this.name = 'EnforceBlockedError';
   }
 }
+
+/** Exact pending call and retained decision; the protected app must encrypt and scope it. */
+export type ApprovalContinuation = {
+  call: ObservedCall;
+  decision: ObserveDecision;
+};
 
 /** The protected function failed after permission; its external effect is unknown. */
 export class EnforceOutcomeUnknownError extends Error {
@@ -31,12 +40,16 @@ export class EnforceOutcomeUnknownError extends Error {
 /** Runs only explicitly allowed calls and withholds results that fail their check. */
 export class EnforceClient {
   readonly #sidecar: ObserveClient;
+  readonly #handlers: Map<string, GuardHandler>;
+  readonly #guardProcessing: boolean;
   readonly #pending = new WeakMap<EnforceBlockedError,
     { call: ObservedCall; decision: ObserveDecision;
       execute: (checkedArguments: JSONObject, context: ExecutionContext) => JSONObject | Promise<JSONObject> }>();
 
   constructor(config: ObserveClientConfig) {
     this.#sidecar = new ObserveClient(config);
+    this.#handlers = registeredHandlers(config.guardHandlers);
+    this.#guardProcessing = config.guardHandlers !== undefined;
   }
 
   async enforce<Result extends JSONObject>(
@@ -49,13 +62,26 @@ export class EnforceClient {
     try { call = this.#sidecar.prepare(operation, argumentsValue); }
     catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
     let callDecision: ObserveDecision;
-    try { callDecision = await this.#sidecar.evaluate(call, 'tool_call', 'enforce'); }
-    catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
+    try {
+      let bundleId: string | undefined;
+      if (this.#guardProcessing) {
+        const processed = await processGuard(
+          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_call'),
+          call.operationVersionId, 'tool_call', call.arguments, this.#handlers);
+        call = { ...call, arguments: processed.output, guardEvidence: processed.evidence };
+        bundleId = processed.bundleId;
+      }
+      callDecision = await this.#sidecar.evaluate(call, 'tool_call', 'enforce');
+      if (bundleId && callDecision.bundleId !== bundleId) throw new Error('Guard bundle changed');
+    } catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
     if (!permitted(callDecision)) {
-      const blocked = new EnforceBlockedError('tool_call', false, callDecision);
-      if (callDecision.outcome === 'approval_required' &&
+      const continuable = callDecision.outcome === 'approval_required' &&
         callDecision.recordingStatus === 'retained' &&
-        callDecision.reportReplayed === false && callDecision.approvalRequestId) {
+        callDecision.reportReplayed === false && !!callDecision.approvalRequestId &&
+        !!callDecision.actionId;
+      const blocked = new EnforceBlockedError('tool_call', false, callDecision, undefined,
+        continuable ? { call, decision: callDecision } : undefined);
+      if (continuable) {
         this.#pending.set(blocked, { call, decision: callDecision, execute });
       }
       throw blocked;
@@ -82,6 +108,46 @@ export class EnforceClient {
     }
     const { result, resultDecision } = await this.#execute(
       pending.call, pending.execute, pending.decision, permit.permitId);
+    return { result, permitId: permit.permitId, resultDecision };
+  }
+
+  /** Resume an approved call after a process or request boundary using protected persisted state. */
+  async resumeApprovalFrom<Result extends JSONObject>(
+    continuation: ApprovalContinuation,
+    execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
+  ): Promise<{ result: Result; permitId: string; resultDecision: ObserveDecision }> {
+    if (typeof execute !== 'function' || !continuation ||
+      !continuation.call || !continuation.decision) {
+      throw new EnforceBlockedError('tool_call', false, null);
+    }
+    const { call, decision } = continuation;
+    let permit: { permitId: string; actionId: string; expiresAt: string };
+    try { permit = await this.#sidecar.claimApproval(call, decision); }
+    catch (cause) { throw new EnforceBlockedError('tool_call', false, decision, cause); }
+    if (Date.parse(permit.expiresAt) <= Date.now()) {
+      throw new EnforceBlockedError('tool_call', false, decision);
+    }
+    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId);
+    return { result, permitId: permit.permitId, resultDecision };
+  }
+
+  /** Resumes only with an existing unexpired permit proven by the control plane. */
+  async recoverApprovalFrom<Result extends JSONObject>(
+    continuation: ApprovalContinuation,
+    execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
+  ): Promise<{ result: Result; permitId: string; resultDecision: ObserveDecision }> {
+    if (typeof execute !== 'function' || !continuation ||
+      !continuation.call || !continuation.decision) {
+      throw new EnforceBlockedError('tool_call', false, null);
+    }
+    const { call, decision } = continuation;
+    let permit: { permitId: string; actionId: string; expiresAt: string };
+    try { permit = await this.#sidecar.recoverApprovalPermit(call, decision); }
+    catch (cause) { throw new EnforceBlockedError('tool_call', false, decision, cause); }
+    if (Date.parse(permit.expiresAt) <= Date.now()) {
+      throw new EnforceBlockedError('tool_call', false, decision);
+    }
+    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId);
     return { result, permitId: permit.permitId, resultDecision };
   }
 
@@ -136,9 +202,25 @@ export class EnforceClient {
         new Error('Tool result is not a bounded JSON object'));
     }
     let resultDecision: ObserveDecision;
-    try { resultDecision = await this.#sidecar.evaluate(call, 'tool_result', 'enforce', result); }
-    catch (cause) { throw new EnforceBlockedError('tool_result', true, null, cause); }
-    if (!permitted(resultDecision)) throw new EnforceBlockedError('tool_result', true, resultDecision);
+    try {
+      let resultCall = call;
+      let bundleId: string | undefined;
+      if (this.#guardProcessing) {
+        const processed = await processGuard(
+          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_result'),
+          call.operationVersionId, 'tool_result', result, this.#handlers);
+        const guardEvidence = [...(call.guardEvidence ?? []), ...processed.evidence];
+        if (guardEvidence.length > 128) throw new Error('Guard processing evidence is too large');
+        resultCall = { ...call, guardEvidence };
+        result = processed.output as Result;
+        bundleId = processed.bundleId;
+      }
+      resultDecision = await this.#sidecar.evaluate(resultCall, 'tool_result', 'enforce', result);
+      if (bundleId && resultDecision.bundleId !== bundleId) throw new Error('Guard bundle changed');
+    } catch (cause) { throw new EnforceBlockedError('tool_result', true, null, cause); }
+    if (!permittedResult(resultDecision, decision, permitId)) {
+      throw new EnforceBlockedError('tool_result', true, resultDecision);
+    }
     return { result, resultDecision };
   }
 }
@@ -152,4 +234,16 @@ function permitted(decision: ObserveDecision): boolean {
   return decision.mode === 'enforce' && decision.enforced === false &&
     decision.coverage === 'evaluated' && decision.outcome === 'allow' &&
     decision.recordingStatus === 'retained' && decision.reportReplayed === false;
+}
+
+function permittedResult(result: ObserveDecision, call: ObserveDecision,
+  permitId: string | null): boolean {
+  if (permitted(result)) return result.actionId === call.actionId;
+  // Policy approval is re-evaluated at the result hook. Only the exact Action
+  // whose one-use permit was already claimed may release that result.
+  return permitId !== null && call.outcome === 'approval_required' &&
+    result.mode === 'enforce' && result.enforced === false &&
+    result.coverage === 'evaluated' && result.outcome === 'approval_required' &&
+    result.recordingStatus === 'retained' && result.reportReplayed === false &&
+    !!call.actionId && result.actionId === call.actionId;
 }

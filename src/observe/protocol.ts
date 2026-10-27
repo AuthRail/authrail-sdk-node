@@ -1,7 +1,7 @@
-import type { FactResolution, JSONObject, ObserveOperation, TrajectorySnapshot } from './types.js';
+import type { FactResolution, GuardEvidence, JSONObject, ObserveOperation, TrajectorySnapshot } from './types.js';
 
 export type Phase = 'tool_call' | 'tool_result';
-export type ObservedCall = ObserveOperation & { arguments: JSONObject; requestId: string };
+export type ObservedCall = ObserveOperation & { arguments: JSONObject; requestId: string; guardEvidence?: GuardEvidence[] };
 type Field = [string, string];
 
 function jsonString(value: string | number | boolean | null): string {
@@ -114,6 +114,7 @@ export function encodeInput(call: ObservedCall, phase: Phase, result?: unknown):
     (items) => `[${items.map(encodeFact).join(',')}]`,
   );
   optional(entries, 'trajectory', call.trajectory, encodeTrajectory);
+  optional(entries, 'guardEvidence', call.guardEvidence);
   return fields(entries);
 }
 

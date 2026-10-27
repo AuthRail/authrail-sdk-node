@@ -31,12 +31,24 @@ After an authenticated no-effect reconciliation, a caller may invoke Enforce
 again with the same action key and business arguments. The new signed call ID
 is its attempt ID; current Rails and any required approval are checked anew.
 
+Configured Guard processing remains at the protected application boundary.
+The SDK reads exact requirements from the authenticated sidecar, resolves a
+registered handler by ID, version digest, and kind, and changes only copied
+reviewed string targets. The signed final evaluation binds processing evidence
+and the exact bundle; a stale plan, missing handler, or processing failure cannot
+authorize execution or result exposure. Call evidence stays in persisted approval
+continuations and result checks. Observe never transforms content. Isolation
+requires a separate supported protected boundary and is not supplied by this
+SDK's string handlers.
+
 ## Code layout
 
 - `src/index.ts` is the public package entry point.
 - `src/observe/client.ts` owns client configuration, the protected-function
   wrapper, request signing, HTTP exchange, and advisory failure behavior.
 - `src/enforce/client.ts` owns the fail-closed protected callback boundary.
+- `src/enforce/guard.ts` validates processing requirements and applies exact
+  application-owned string handlers before final evaluation.
 - `src/observe/protocol.ts` owns bounded JSON encoding and the exact signed
   protocol representation shared with the sidecar.
 - `src/observe/types.ts` owns the public Observe types.
