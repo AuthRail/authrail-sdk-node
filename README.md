@@ -4,52 +4,185 @@
 
 # AuthRail Node SDK
 
-The AuthRail Node SDK is a TypeScript-first adapter for checking AI-requested
-actions in a protected Node.js application. Add its checks where your
-application handles an action. Your application still owns the tool and its
-credentials. The SDK sends the action and its result to a sidecar running
-beside the application, then returns what your active Rails would decide.
+AuthRail helps you see what your AI agents are doing and set rules for the
+actions they may take. In your AuthRail workspace, you describe an action,
+publish its rules, and review the decisions and execution reports it produces.
+Those published rules are called **Rails**.
 
-**Observe checks are advisory.** A deny decision,
-missing sidecar, or recording failure does not stop your function. Use the
-returned observation to monitor coverage; do not treat it as enforcement or
-proof that a business action completed.
+This SDK connects a Node.js application to AuthRail. Add it around the function
+that handles an AI-requested action, such as paying an invoice or posting a
+message. Your application keeps its business logic and provider credentials.
+The SDK checks the requested call and its result with an AuthRail **sidecar**:
+a small service you run beside the application. The sidecar evaluates the
+Rails selected for that deployment and sends records to your workspace.
+
+Start in **Observe** to see the decisions without changing your application's
+behavior. A denied check, unavailable sidecar, or recording failure does not
+stop an Observe callback. When you are ready to protect the action, use
+**Enforce**: it requires permission before the callback and checks the result
+before returning it. A decision explains permission; an execution report says
+what your application reported doing. Neither independently proves a provider
+effect.
 
 ## What you need
 
-- Node.js 20 or newer, with the SDK in your protected application—not in an
-  agent-accessible tool or browser bundle.
-- A reviewed AuthRail Operation Version and an Observe deployment for the AI
-  system whose action you are checking.
-- An AuthRail sidecar on the same host, configured with that deployment's
-  credential, an adapter token, and a durable private state path.
-- An Ed25519 application key pair. Register its public key on the deployment
-  page and give it to the sidecar. Keep its private key in the protected
-  application.
+Prepare these in order before running an SDK check:
 
-Create the key pair with:
+1. Create an AuthRail account if you need one, then sign in and open your
+   organisation's workspace. You need access to manage its AI Inventory and
+   Runtime configuration; installing the SDK does not create this setup.
+2. Add or select the AI system in **AI Inventory** and confirm its identity.
+   Create and review the action it will request, including its inputs and
+   results. Keep that action's exact **Operation Version ID** for your code.
+3. Publish the Rails for that action, then create an **Observe deployment**
+   using the reviewed AI system revision and exact Rail versions. A deployment
+   identifies the application setup whose decisions you want to track.
+4. Generate the application's Ed25519 signing key pair below. Register its
+   public key on the deployment. Keep the private key with the application.
+5. Start the [AuthRail sidecar](https://github.com/AuthRail/authrail-sidecar#readme)
+   for that deployment. Docker is the recommended setup. Give the sidecar its
+   deployment credential, the executor public key, a separate adapter token,
+   and private durable storage. Check its health before connecting the SDK.
+6. Use Node.js 20 or newer in the protected application. Derive caller,
+   session and resource IDs from authenticated application context.
+
+Create the key pair in a private application directory:
 
 ```bash
+umask 077
 openssl genpkey -algorithm Ed25519 -out executor-private.pem
 openssl pkey -in executor-private.pem -pubout -out executor-public.pem
 ```
 
-The adapter token is **not** the sidecar's AuthRail deployment credential.
-Both must stay out of the agent. Follow the
-[sidecar setup guide](https://github.com/AuthRail/authrail-sidecar#readme) for
-its deployment credential, durable state, and local health endpoint. Install
-this SDK in the protected Node application; it does not replace the sidecar.
-For a Go application, use the
-[Go SDK](https://github.com/AuthRail/authrail-sdk-go) with the same sidecar.
+The SDK uses the private key to sign its checks. The sidecar and AuthRail use
+only the public key to check those signatures. The **adapter token** lets the
+SDK call the local sidecar; the **deployment credential** lets the sidecar
+connect to AuthRail. These are separate credentials. Keep both, the private
+key, and provider credentials outside the agent and browser bundle.
+
+The SDK runs inside your Node application. The sidecar is a separate running
+process; installing or building this SDK does not start it. The local URL
+`http://127.0.0.1:7078` works when they share a network namespace. With Docker,
+follow the sidecar guide to put the protected application in that namespace;
+`127.0.0.1` in an unrelated container points at that container itself. For a Go
+application, use the [Go SDK](https://github.com/AuthRail/authrail-sdk-go) with
+the same sidecar protocol.
 
 ## Install
 
+For the current source setup, clone the SDK, install its development tools,
+and compile it:
+
 ```bash
-npm install @authrail/sdk-node
+git clone --branch main https://github.com/AuthRail/authrail-sdk-node.git
+cd authrail-sdk-node
+npm ci
+npm run build
 ```
 
-The package exports compiled JavaScript and TypeScript declarations from
-`dist/`. This repository uses `npm ci` and `npm run build` for local development.
+`npm ci` installs the locked development dependencies. `npm run build` compiles
+TypeScript into `dist/`; it does not start an application or contact AuthRail.
+Use a reviewed commit when you need a reproducible setup. From your own
+application directory, which should have a `package.json`, install that built
+checkout:
+
+```bash
+npm install /absolute/path/to/authrail-sdk-node
+```
+
+Your application can then import `@authrail/sdk-node`, as shown below.
+`package.json` currently declares version `0.1.0`; that source version does not
+establish a published npm release. The checkout instructions above avoid
+assuming that `npm install @authrail/sdk-node` is available from the registry.
+
+Continue with [Observe your first action](#observe-your-first-action). The
+later sections cover optional discovery and source facts when your action
+needs them.
+
+## Observe your first action
+
+Create one client in the protected application. Load the private key from your
+secret store or a private file; the example uses a file for clarity.
+
+```ts
+import { readFileSync } from "node:fs";
+import { ObserveClient } from "@authrail/sdk-node";
+
+const authrail = new ObserveClient({
+  sidecarUrl: "http://127.0.0.1:7078",
+  adapterToken: process.env.AUTHRAIL_ADAPTER_TOKEN!,
+  organisationId: organisation.id,
+  deploymentId: deployment.id,
+  executorPrivateKey: readFileSync(process.env.AUTHRAIL_EXECUTOR_PRIVATE_KEY_FILE!, "utf8"),
+});
+
+const { result, observation } = authrail.observe(
+  {
+    operationVersionId: reviewedOperation.versionId,
+    actionKey: invoice.stableActionKey,
+    principalId: authenticatedSession.principalId,
+    sessionId: authenticatedSession.id,
+    resourceId: invoice.id,
+    principalSource: "application_session",
+    resourceSource: "application_lookup",
+  },
+  { invoiceId: invoice.id },
+  () => invoiceService.read(invoice.id),
+);
+
+const invoiceResult = await result;
+const checks = await observation;
+console.log(invoiceResult);
+console.log(checks.callDecision?.outcome, checks.resultDecision?.outcome);
+console.log(checks.callError, checks.resultError);
+```
+
+This snippet belongs in your existing application: `organisation`, `deployment`,
+`reviewedOperation`, `invoice`, `authenticatedSession` and `invoiceService` are
+its reviewed configuration and business objects. Replace them with your own
+values; the snippet is not a standalone server. The action contract must cover
+these input/result fields and caller/resource identities.
+
+With a healthy Observe deployment, the function returns the invoice and the
+checks contain call and result decisions. Their outcomes depend on your
+published Rails. `recordingStatus: "retained"` means AuthRail stored that check;
+`"queued"` means the sidecar saved it for later delivery. Open the deployment's
+Runtime history in your workspace to inspect retained decisions. If either
+check has an error, inspect the sidecar's health and credentials; the invoice
+function still runs in Observe.
+
+`result` is the protected function's value or error. `observation` has separate
+call and result decisions or errors. The call check starts before the function
+but never holds it up. A result check runs only after the function succeeds
+and the call check settles. A failed function has no result check.
+
+Use your application's authenticated session to supply `principalId` and
+`sessionId`. Resolve `resourceId` in your application and use
+`resourceSource: "application_lookup"` only when the reviewed Operation targets
+that resource. For an Operation without resource identity, omit `resourceId`
+and use `"not_applicable"`. A service-authenticated caller uses
+`principalSource: "service_identity"`.
+
+Use one stable `actionKey` for retries of the same business action. A different
+action needs a different key. Arguments and successful results must be bounded
+JSON objects. The SDK creates the request ID and signs both checks with the
+application key; it does not independently verify the person, resource, or
+business result you supplied.
+
+## Read the check
+
+| Field | Meaning |
+| --- | --- |
+| `callDecision` / `resultDecision` | What the active Rails would decide for each covered phase. |
+| `callError` / `resultError` | Local validation, sidecar, or response failure. The tool result is separate. |
+| `coverage` | Whether the phase was evaluated, uncovered, or unavailable. |
+| `recordingStatus: "retained"` | AuthRail saved the report and returned Action/certificate references. |
+| `recordingStatus: "queued"` | The sidecar saved the report locally for retry; AuthRail has not retained it yet. |
+| `recordingStatus: "unavailable"` | The report is not known to be retained. Investigate the recording gap. |
+
+A would-deny result in Observe mode is **not** a blocked operation. A successful
+tool function is **not** evidence that its report was retained. Monitor
+`observation` and the deployment's health and logs in AuthRail.
 
 ## Discover and supply reviewed facts
 
@@ -138,74 +271,6 @@ const checkedOperation = { ...operation, factResolutions: [fact] };
 Use `traceparent` on an Operation only when it comes from the protected
 application's trace context. The sidecar forwards it for correlation; it
 does not prove caller identity, permission, or execution.
-
-## Observe your first action
-
-Create one client in the protected application. Load the private key from your
-secret store or a private file; the example uses a file for clarity.
-
-```ts
-import { readFileSync } from "node:fs";
-import { ObserveClient } from "@authrail/sdk-node";
-
-const authrail = new ObserveClient({
-  sidecarUrl: "http://127.0.0.1:7078",
-  adapterToken: process.env.AUTHRAIL_ADAPTER_TOKEN!,
-  organisationId: organisation.id,
-  deploymentId: deployment.id,
-  executorPrivateKey: readFileSync(process.env.AUTHRAIL_EXECUTOR_PRIVATE_KEY_FILE!, "utf8"),
-});
-
-const { result, observation } = authrail.observe(
-  {
-    operationVersionId: reviewedOperation.versionId,
-    actionKey: invoice.stableActionKey,
-    principalId: authenticatedSession.principalId,
-    sessionId: authenticatedSession.id,
-    resourceId: invoice.id,
-    principalSource: "application_session",
-    resourceSource: "application_lookup",
-  },
-  { invoiceId: invoice.id },
-  () => invoiceService.read(invoice.id),
-);
-
-const invoiceResult = await result;
-const checks = await observation;
-```
-
-`result` is the protected function's value or error. `observation` has separate
-call and result decisions or errors. The call check starts before the function
-but never holds it up. A result check runs only after the function succeeds
-and the call check settles. A failed function has no result check.
-
-Use your application's authenticated session to supply `principalId` and
-`sessionId`. Resolve `resourceId` in your application and use
-`resourceSource: "application_lookup"` only when the reviewed Operation targets
-that resource. For an Operation without resource identity, omit `resourceId`
-and use `"not_applicable"`. A service-authenticated caller uses
-`principalSource: "service_identity"`.
-
-Use one stable `actionKey` for retries of the same business action. A different
-action needs a different key. Arguments and successful results must be bounded
-JSON objects. The SDK creates the request ID and signs both checks with the
-application key; it does not independently verify the person, resource, or
-business result you supplied.
-
-## Read the check
-
-| Field | Meaning |
-| --- | --- |
-| `callDecision` / `resultDecision` | What the active Rails would decide for each covered phase. |
-| `callError` / `resultError` | Local validation, sidecar, or response failure. The tool result is separate. |
-| `coverage` | Whether the phase was evaluated, uncovered, or unavailable. |
-| `recordingStatus: "retained"` | AuthRail saved the report and returned Action/certificate references. |
-| `recordingStatus: "queued"` | The sidecar saved the report locally for retry; AuthRail has not retained it yet. |
-| `recordingStatus: "unavailable"` | The report is not known to be retained. Investigate the recording gap. |
-
-A would-deny result in Observe mode is **not** a blocked operation. A successful
-tool function is **not** evidence that its report was retained. Monitor
-`observation` and the deployment's health and logs in AuthRail.
 
 ## Trusted context and security
 
