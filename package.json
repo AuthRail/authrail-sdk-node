@@ -2,7 +2,7 @@
   "name": "@authrail/sdk-node",
   "version": "0.1.0",
   "type": "module",
-  "files": ["dist/index.js", "dist/index.d.ts", "dist/observe", "assets", "README.md", "ARCHITECTURE.md", "CONTRIBUTING.md", "LICENSE"],
+  "files": ["dist/index.js", "dist/index.d.ts", "dist/observe/client.js", "dist/observe/client.d.ts", "dist/observe/protocol.js", "dist/observe/protocol.d.ts", "dist/observe/types.js", "dist/observe/types.d.ts", "dist/enforce/client.js", "dist/enforce/client.d.ts", "dist/enforce/guard.js", "dist/enforce/guard.d.ts", "dist/discovery.js", "dist/discovery.d.ts", "dist/facts.js", "dist/facts.d.ts", "dist/contextual-decisions.js", "dist/contextual-decisions.d.ts", "assets", "conformance", "examples", "README.md", "ARCHITECTURE.md", "CONTRIBUTING.md", "LICENSE"],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
