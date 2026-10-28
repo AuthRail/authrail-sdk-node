@@ -31,7 +31,8 @@ export class EnforceOutcomeUnknownError extends Error {
   readonly effectMayHaveOccurred = true;
 
   constructor(cause: unknown, readonly recovery?: { actionId: string; attemptId: string;
-    permitId: string | null; inputSha256: string; providerIdempotencyKey: string }) {
+    permitId: string | null; inputSha256: string; providerIdempotencyKey: string },
+    readonly callDecision?: ObserveDecision) {
     super('Protected tool outcome is unknown; reconcile before retrying', { cause });
     this.name = 'EnforceOutcomeUnknownError';
   }
@@ -187,13 +188,13 @@ export class EnforceClient {
     catch (cause) {
       try { await this.#sidecar.reportExecution({ ...recovery,
         event: 'unknown', providerReference: null }); } catch { /* recovery remains required */ }
-      throw new EnforceOutcomeUnknownError(cause, recovery);
+      throw new EnforceOutcomeUnknownError(cause, recovery, decision);
     }
     try {
       const completed = await this.#sidecar.reportExecution({ ...recovery,
         event: 'succeeded', providerReference: null });
       if (completed.state !== 'succeeded') throw new Error('Completion was not retained as succeeded');
-    } catch (cause) { throw new EnforceOutcomeUnknownError(cause, recovery); }
+    } catch (cause) { throw new EnforceOutcomeUnknownError(cause, recovery, decision); }
     let bounded = false;
     try { bounded = jsonObject(result) && Buffer.byteLength(goJSON(result)) <= 64 * 1024; }
     catch { bounded = false; }

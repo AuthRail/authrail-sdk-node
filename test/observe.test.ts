@@ -294,6 +294,7 @@ test('Enforce preserves an uncertain tool outcome for reconciliation', async () 
   await assert.rejects(adapter.enforce(operation(), {}, () => {
     throw new Error('provider timed out');
   }), (error) => error instanceof EnforceOutcomeUnknownError &&
+    error.callDecision?.outcome === 'allow' && error.callDecision.recordingStatus === 'retained' &&
     error.recovery?.actionId === actionId &&
     error.recovery.providerIdempotencyKey === `ar-${actionId}`);
   assert.deepEqual(events, ['started', 'unknown']);
