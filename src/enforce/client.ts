@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { ObserveClient } from '../observe/client.js';
 import type { ObservedCall } from '../observe/protocol.js';
-import { encodeInput, goJSON, jsonObject } from '../observe/protocol.js';
+import { encodeInput, freezeContext, goJSON, jsonObject } from '../observe/protocol.js';
 import { processGuard, registeredHandlers } from './guard.js';
 import type { GuardHandler, JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
 
@@ -30,8 +30,7 @@ export type ApprovalContinuation = {
 export class EnforceOutcomeUnknownError extends Error {
   readonly effectMayHaveOccurred = true;
 
-  constructor(cause: unknown, readonly recovery?: { actionId: string; attemptId: string;
-    permitId: string | null; inputSha256: string; providerIdempotencyKey: string },
+  constructor(cause: unknown, readonly recovery?: ExecutionContext,
     readonly callDecision?: ObserveDecision) {
     super('Protected tool outcome is unknown; reconcile before retrying', { cause });
     this.name = 'EnforceOutcomeUnknownError';
@@ -65,15 +64,19 @@ export class EnforceClient {
     let callDecision: ObserveDecision;
     try {
       let bundleId: string | undefined;
+      let sequence: number | undefined;
       if (this.#guardProcessing) {
         const processed = await processGuard(
-          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_call'),
+          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_call', call.traceparent),
           call.operationVersionId, 'tool_call', call.arguments, this.#handlers);
         call = { ...call, arguments: processed.output, guardEvidence: processed.evidence };
         bundleId = processed.bundleId;
+        sequence = processed.sequence;
       }
       callDecision = await this.#sidecar.evaluate(call, 'tool_call', 'enforce');
-      if (bundleId && callDecision.bundleId !== bundleId) throw new Error('Guard bundle changed');
+      if (bundleId && (callDecision.bundleId !== bundleId || callDecision.sequence !== sequence)) {
+        throw new Error('Guard bundle changed');
+      }
     } catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
     if (!permitted(callDecision)) {
       const continuable = callDecision.outcome === 'approval_required' &&
@@ -184,7 +187,8 @@ export class EnforceClient {
     // Only the protected application receives this callback and provider credentials.
     // The SDK cannot prove that a separate agent path cannot reach the same effect.
     let result: Result;
-    try { result = await execute(call.arguments, recovery) as Result; }
+    // Application-local mutation must not rewrite the signed call or receipt identity.
+    try { result = await execute(freezeContext(call.arguments), { ...recovery }) as Result; }
     catch (cause) {
       try { await this.#sidecar.reportExecution({ ...recovery,
         event: 'unknown', providerReference: null }); } catch { /* recovery remains required */ }
@@ -206,18 +210,22 @@ export class EnforceClient {
     try {
       let resultCall = call;
       let bundleId: string | undefined;
+      let sequence: number | undefined;
       if (this.#guardProcessing) {
         const processed = await processGuard(
-          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_result'),
+          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_result', call.traceparent),
           call.operationVersionId, 'tool_result', result, this.#handlers);
         const guardEvidence = [...(call.guardEvidence ?? []), ...processed.evidence];
         if (guardEvidence.length > 128) throw new Error('Guard processing evidence is too large');
         resultCall = { ...call, guardEvidence };
         result = processed.output as Result;
         bundleId = processed.bundleId;
+        sequence = processed.sequence;
       }
       resultDecision = await this.#sidecar.evaluate(resultCall, 'tool_result', 'enforce', result);
-      if (bundleId && resultDecision.bundleId !== bundleId) throw new Error('Guard bundle changed');
+      if (bundleId && (resultDecision.bundleId !== bundleId || resultDecision.sequence !== sequence)) {
+        throw new Error('Guard bundle changed');
+      }
     } catch (cause) { throw new EnforceBlockedError('tool_result', true, null, cause); }
     if (!permittedResult(resultDecision, decision, permitId)) {
       throw new EnforceBlockedError('tool_result', true, resultDecision);

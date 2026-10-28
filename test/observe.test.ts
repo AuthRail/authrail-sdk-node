@@ -4,13 +4,14 @@ import { createHash, generateKeyPairSync, randomUUID, verify } from 'node:crypto
 import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { EnforceBlockedError, EnforceClient, EnforceOutcomeUnknownError, ObserveClient } from '../src/index.js';
-import type { GuardEvidence, GuardHandler, ObserveOperation } from '../src/index.js';
+import type { GuardEvidence, GuardHandler, JSONObject, ObserveOperation } from '../src/index.js';
 import { encodeInput, goJSON } from '../src/observe/protocol.js';
 import type { ObservedCall } from '../src/observe/protocol.js';
 
 type RequestBody = {
   requestId: string;
   phase: 'tool_call' | 'tool_result';
+  arguments: JSONObject;
   attribution: Record<string, unknown>;
   identityProof: { issuedAt: number; expiresAt: number; signature: string };
   reviewSummary?: { title: string; fields: Array<{ label: string; value: string }> };
@@ -170,6 +171,7 @@ test('shared failure fixtures keep effects and result exposure distinct', async 
   }
 });
 
+// The callback may mutate its own working values without rewriting retained call identity.
 test('Enforce runs only after a retained allow and checks the result before exposure', async () => {
   const traceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
   const phases: string[] = [];
@@ -182,6 +184,7 @@ test('Enforce runs only after a retained allow and checks the result before expo
       return receiptResponse(init, phases);
     }
     const body = requestBody(init);
+    assert.deepEqual(body.arguments, { invoiceId: 'invoice_123' });
     if (body.phase === 'tool_call') callRequestId = body.requestId;
     phases.push(body.phase);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
@@ -190,8 +193,10 @@ test('Enforce runs only after a retained allow and checks the result before expo
       { status: 200 });
   });
   let effects = 0;
-  const completed = await adapter.enforce({ ...operation(), traceparent }, { invoiceId: 'invoice_123' }, () => {
+  const completed = await adapter.enforce({ ...operation(), traceparent }, { invoiceId: 'invoice_123' }, (args, execution) => {
     effects++;
+    args.invoiceId = 'local-working-copy';
+    execution.actionId = 'local-working-copy';
     return { status: 'paid' };
   });
   assert.equal(effects, 1);
@@ -804,11 +809,13 @@ const hashString = (value: string) => createHash('sha256').update(goJSON(value))
 
 // Security risk: processing must be exact-version, signed, mutation-safe, and retained across both hooks.
 test('Guard handlers process copies once and sign call and result evidence', async () => {
+  const traceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
   const evaluated: Array<{ phase: string; arguments: { text: string }; result?: { text: string };
     guardEvidence: GuardEvidence[] }> = [];
   const receipts: string[] = [];
   let processed = 0;
   const adapter = processingClient(async (url, init) => {
+    assert.equal(new Headers(init?.headers).get('traceparent'), traceparent);
     const endpoint = new URL(String(url));
     if (endpoint.pathname === '/guard-requirements') {
       assert.equal(new Headers(init?.headers).get('Authorization'), `Bearer ${adapterToken}`);
@@ -825,13 +832,13 @@ test('Guard handlers process copies once and sign call and result evidence', asy
       createHash('sha256').update(canonical).digest('hex'))), keys.publicKey,
       Buffer.from(body.identityProof.signature, 'base64url')), true);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
-      enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: guardBundleId,
+      enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: guardBundleId, sequence: 1,
       recordingStatus: 'retained', reportReplayed: false, actionId }));
   }, [{ id: 'redact', version: guardVersion, kind: 'sanitize', process: (text) => {
     processed++; return text.replace('secret', '[redacted]');
   } }]);
   const original = { text: '<secret>' }, originalResult = { text: 'secret output' };
-  const checked = await adapter.enforce(operation(), original, (args) => {
+  const checked = await adapter.enforce({ ...operation(), traceparent }, original, (args) => {
     assert.deepEqual(args, { text: '<[redacted]>' }); return originalResult;
   });
   assert.deepEqual(original, { text: '<secret>' });
@@ -848,7 +855,7 @@ test('Guard handlers process copies once and sign call and result evidence', asy
 
 // Security risk: unavailable plans, unregistered versions, isolation, and conflicting targets must never run effects.
 test('Guard processing blocks unavailable, mismatched, and conflicting plans before execution', async () => {
-  for (const failure of ['unavailable', 'version', 'overlap', 'isolate', 'bundle', 'prototype']) {
+  for (const failure of ['unavailable', 'version', 'overlap', 'isolate', 'bundle', 'sequence', 'missing sequence', 'prototype']) {
     let effects = 0;
     const adapter = processingClient(async (url, init) => {
       const endpoint = new URL(String(url));
@@ -865,7 +872,9 @@ test('Guard processing blocks unavailable, mismatched, and conflicting plans bef
       if (endpoint.pathname === '/execution-receipts') return receiptResponse(init);
       const body = requestBody(init);
       return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
-        enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: randomUUID(),
+        enforced: false, coverage: 'evaluated', outcome: 'allow',
+        bundleId: failure === 'bundle' ? randomUUID() : guardBundleId,
+        ...(failure === 'missing sequence' ? {} : { sequence: failure === 'sequence' ? 2 : 1 }),
         recordingStatus: 'retained', reportReplayed: false, actionId }));
     }, [{ id: 'redact', version: guardVersion, kind: 'sanitize', process: (text) => text }]);
     await assert.rejects(adapter.enforce(operation(), { text: 'secret' }, () => {
@@ -888,7 +897,7 @@ test('Guard result handler failures withhold the result after the effect', async
     if (endpoint.pathname === '/execution-receipts') return receiptResponse(init);
     const body = requestBody(init); phases.push(body.phase);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
-      enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: guardBundleId,
+      enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: guardBundleId, sequence: 1,
       recordingStatus: 'retained', reportReplayed: false, actionId }));
   }, [{ id: 'redact', version: guardVersion, kind: 'sanitize', process: () => { throw new Error('failed'); } }]);
   await assert.rejects(adapter.enforce(operation(), {}, () => { effects++; return { text: 'secret' }; }),
@@ -914,7 +923,7 @@ test('Guard approval continuations retain processed input without rerunning the 
     if (endpoint.pathname === '/execution-receipts') return receiptResponse(init);
     const body = requestBody(init);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
-      enforced: false, coverage: 'evaluated', outcome: 'approval_required', bundleId: guardBundleId,
+      enforced: false, coverage: 'evaluated', outcome: 'approval_required', bundleId: guardBundleId, sequence: 1,
       recordingStatus: 'retained', reportReplayed: false, actionId,
       ...(body.phase === 'tool_call' ? { approvalRequestId } : {}) }));
   };

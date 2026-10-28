@@ -69,7 +69,7 @@ function parsePlan(value: unknown, operationVersionId: string, phase: Phase) {
     seen.add(key);
     requirements.push(requirement);
   }
-  return { bundleId: value.bundleId, requirements };
+  return { bundleId: value.bundleId, sequence: Number(value.sequence), requirements };
 }
 
 /** Process a copy; only exact reviewed string targets can change before final evaluation. */
@@ -109,5 +109,5 @@ export async function processGuard(value: unknown, operationVersionId: string, p
       inputSha256: createHash('sha256').update(goJSON(before)).digest('hex'),
       outputSha256: createHash('sha256').update(goJSON(after)).digest('hex') });
   }
-  return { output, evidence, bundleId: plan.bundleId };
+  return { output, evidence, bundleId: plan.bundleId, sequence: plan.sequence };
 }

@@ -249,7 +249,8 @@ The handler ID, lowercase SHA-256 version, and kind must match the reviewed
 Guard. Use deterministic, side-effect-free string handlers. Enforce reads the
 current requirements from the authenticated local sidecar, processes copies of
 only the reviewed string fields, and signs their before/after digests with the
-final decision input. It checks transformed results before exposing them.
+final decision input. Both the bundle ID and sequence must match the final
+phase decision. It checks transformed results before exposing them.
 Unavailable plans, missing handlers, conflicting targets, handler failures,
 and unsupported isolation block the boundary. A handler has four seconds to
 complete; a timed-out Promise may continue in the application, so handlers must
@@ -326,7 +327,13 @@ only when the original Action has a claimed permit and the result belongs to
 that exact Action. A result denial, missing report, or different Action blocks
 exposure even after the mock or provider effect ran.
 A lost or rejected permit claim never runs the callback; inspect the Action
-before another claim. The SDK does not persist a continuation for the caller.
+before another claim. If the claim response was lost, use
+`recoverApprovalFrom(continuation, callback)` to read only the existing,
+unexpired, unstarted permit for the same Action, input and executor. This does
+not issue a replacement permit. Missing or uncertain recovery blocks the
+callback; a start receipt or provider outcome that is already uncertain needs
+Action inspection and provider reconciliation. The SDK does not persist a
+continuation for the caller.
 
 If the signed Enforce bundle expires or becomes unavailable, protected calls
 stop. A tenant manager can switch the deployment back to Observe, renew the
@@ -348,6 +355,14 @@ behavior and shared protocol encoding live under `src/observe/`. The package
 also includes the current `conformance/v1` fixture corpus for adapter authors. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries and
 [CONTRIBUTING.md](CONTRIBUTING.md) for validation rules.
+
+For a sibling checkout of both SDKs and the sidecar, run
+`sh scripts/check-sidecar.sh` from `authrail-sdk-go`. This builds this SDK and
+exercises both languages against the real sidecar HTTP handlers with generated
+keys, a signed fixture bundle and temporary private state. It checks allow,
+deny, persisted approval recovery and duplicate-start blocking. Its control
+plane is a fixture: it verifies protocol translation without claiming central
+persistence, provider effects, complete coverage or release acceptance.
 
 
 ### Report execution outcomes while observing

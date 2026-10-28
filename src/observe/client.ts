@@ -184,15 +184,18 @@ export class ObserveClient {
   }
 
   /** Read the active bundle's processing requirements; this never authorizes an action. */
-  async guardRequirements(operationVersionId: string, phase: Phase): Promise<unknown> {
-    if (!uuid.test(operationVersionId) || !['tool_call', 'tool_result'].includes(phase)) {
+  async guardRequirements(operationVersionId: string, phase: Phase, traceparent?: string): Promise<unknown> {
+    if (!uuid.test(operationVersionId) || !['tool_call', 'tool_result'].includes(phase) ||
+      (traceparent !== undefined && (!traceparentPattern.test(traceparent) ||
+        /^00-0{32}-/.test(traceparent) || /-0{16}-/.test(traceparent)))) {
       throw new Error('Guard requirements request is invalid');
     }
     const endpoint = new URL('/guard-requirements', this.#endpoint);
     endpoint.searchParams.set('operationVersionId', operationVersionId);
     endpoint.searchParams.set('phase', phase);
     const response = await this.#fetch(endpoint, { method: 'GET', redirect: 'manual',
-      headers: { Authorization: `Bearer ${this.#token}` }, signal: AbortSignal.timeout(4000) });
+      headers: { Authorization: `Bearer ${this.#token}`,
+        ...(traceparent ? { traceparent } : {}) }, signal: AbortSignal.timeout(4000) });
     if (response.status !== 200) throw new Error(`Sidecar returned HTTP ${response.status}`);
     return boundedJSON(response);
   }

@@ -37,7 +37,8 @@ export function openAIDecisionsConfigSha256(question: DecisionsQuestion): string
   return createHash('sha256').update(JSON.stringify(questionConfig(question))).digest('hex');
 }
 
-/** Creates a protected-executor extractor. Document bytes go only to the configured OpenAI endpoint. */
+/** Sends selected document bytes to OpenAI. The protected application must authorise
+ * and minimise that disclosure first; this client does not redact protected content. */
 export function newOpenAIDecisionsExtractor(config: {
   source: ExtractionSource; question: DecisionsQuestion; apiKey: string;
   fetch?: typeof globalThis.fetch;
