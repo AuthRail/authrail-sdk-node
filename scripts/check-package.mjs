@@ -11,9 +11,11 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const scratch = mkdtempSync(join(tmpdir(), 'authrail-node-package-'));
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 try {
-  const packed = JSON.parse(execFileSync(npm,
+  const report = JSON.parse(execFileSync(npm,
     ['pack', '--json', '--silent', '--pack-destination', scratch],
     { cwd: repository, encoding: 'utf8' }));
+  // npm 12 keys JSON results by package name; earlier versions return an array.
+  const packed = Array.isArray(report) ? report : Object.values(report);
   assert.equal(packed.length, 1);
   const tarball = join(scratch, packed[0].filename);
   writeFileSync(join(scratch, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
