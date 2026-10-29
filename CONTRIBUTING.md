@@ -44,3 +44,5 @@ Its disposable signed control-plane fixture exercises the real sidecar handlers;
 it does not prove tenant persistence or provider effects. No deployment secrets
 are needed. Updating companion pins requires rerunning the compatibility job.
 CI does not publish packages.
+
+Maintainers: see [Releasing](RELEASING.md) for checked artifacts and publication setup.
