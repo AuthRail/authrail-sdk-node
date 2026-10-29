@@ -1,0 +1,68 @@
+name: SDK CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, feat/runtime-observe-adapter]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Node ${{ matrix.node }} package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24', '26']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Verify packed installation and public types
+        run: node scripts/check-package.mjs
+
+  sidecar:
+    name: Node and Go real-sidecar compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: authrail-sdk-node
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: AuthRail/authrail-sdk-go
+          ref: ae94391959800b1cac85a7046a4d2297dbd2092c
+          path: authrail-sdk-go
+          persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: AuthRail/authrail-sidecar
+          ref: 1e07b16e7123f524cee73e7b1b32256bc5eb04d5
+          path: authrail-sidecar
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: authrail-sdk-node/package-lock.json
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - run: npm ci
+        working-directory: authrail-sdk-node
+      - run: sh scripts/check-sidecar.sh
+        working-directory: authrail-sdk-go
