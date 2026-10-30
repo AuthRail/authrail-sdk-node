@@ -70,30 +70,31 @@ the same sidecar protocol.
 
 ## Install
 
-For the current source setup, clone the SDK, install its development tools,
-and compile it:
+Install the [npm package](https://www.npmjs.com/package/@authrail/sdk-node) from
+your application's directory:
 
 ```bash
-git clone --branch main https://github.com/AuthRail/authrail-sdk-node.git
+npm install @authrail/sdk-node@0.1.1
+```
+
+Your application can then import `@authrail/sdk-node`, as shown below. Installing
+the package does not start the sidecar or configure your AuthRail deployment.
+
+<details>
+<summary>Build from source when contributing</summary>
+
+```bash
+git clone https://github.com/AuthRail/authrail-sdk-node.git
 cd authrail-sdk-node
 npm ci
 npm run build
 ```
 
-`npm ci` installs the locked development dependencies. `npm run build` compiles
-TypeScript into `dist/`; it does not start an application or contact AuthRail.
-Use a reviewed commit when you need a reproducible setup. From your own
-application directory, which should have a `package.json`, install that built
-checkout:
+This compiles TypeScript into `dist/`. To try your changes in another application,
+run `npm install /absolute/path/to/authrail-sdk-node` from that application.
+See [Contributing](CONTRIBUTING.md) for checks.
 
-```bash
-npm install /absolute/path/to/authrail-sdk-node
-```
-
-Your application can then import `@authrail/sdk-node`, as shown below.
-`package.json` currently declares version `0.1.0`; that source version does not
-establish a published npm release. The checkout instructions above avoid
-assuming that `npm install @authrail/sdk-node` is available from the registry.
+</details>
 
 Continue with [Observe your first action](#observe-your-first-action). The
 later sections cover optional discovery and source facts when your action
