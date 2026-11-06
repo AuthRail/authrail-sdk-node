@@ -63,6 +63,17 @@ function operation(): ObserveOperation {
   };
 }
 
+function legacySidecar(fetchImpl: typeof fetch): typeof fetch {
+  return async (url, init) => {
+    if (new URL(String(url)).pathname === '/contextual-requirements') {
+      assert.equal(init?.method, 'GET');
+      assert.equal(new Headers(init?.headers).get('Authorization'), `Bearer ${adapterToken}`);
+      return new Response(null, { status: 404 });
+    }
+    return fetchImpl(url, init);
+  };
+}
+
 function client(fetchImpl: typeof fetch) {
   return new ObserveClient({
     sidecarUrl: 'http://127.0.0.1:7078',
@@ -70,13 +81,13 @@ function client(fetchImpl: typeof fetch) {
     organisationId,
     deploymentId,
     executorPrivateKey: keys.privateKey,
-    fetch: fetchImpl,
+    fetch: legacySidecar(fetchImpl),
   });
 }
 
 function enforceClient(fetchImpl: typeof fetch) {
   return new EnforceClient({ sidecarUrl: 'http://127.0.0.1:7078', adapterToken,
-    organisationId, deploymentId, executorPrivateKey: keys.privateKey, fetch: fetchImpl });
+    organisationId, deploymentId, executorPrivateKey: keys.privateKey, fetch: legacySidecar(fetchImpl) });
 }
 
 test('shared decision conformance fixtures gate protected effects', async () => {
@@ -725,6 +736,9 @@ test('invalid sidecar response is a coverage gap, not a tool denial', async () =
 test('real loopback HTTP sends authenticated, signed call and result requests', async () => {
   const requests: RequestBody[] = [];
   const server = createServer(async (request, response) => {
+    if (request.url?.startsWith('/contextual-requirements?')) {
+      response.writeHead(404); response.end(); return;
+    }
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as RequestBody;
@@ -803,7 +817,7 @@ function guardPlan(phase: 'tool_call' | 'tool_result', requirements = [guardRequ
 function processingClient(fetchImpl: typeof fetch, handlers: GuardHandler[]) {
   return new EnforceClient({ sidecarUrl: 'http://127.0.0.1:7078', adapterToken,
     organisationId, deploymentId, executorPrivateKey: keys.privateKey,
-    fetch: fetchImpl, guardHandlers: handlers });
+    fetch: legacySidecar(fetchImpl), guardHandlers: handlers });
 }
 const hashString = (value: string) => createHash('sha256').update(goJSON(value)).digest('hex');
 

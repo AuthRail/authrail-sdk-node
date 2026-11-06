@@ -225,43 +225,31 @@ Provider or customer API credentials remain in the protected application,
 outside the agent and sidecar. Configure all helpers from the exact reviewed
 Context Source Version, never from an agent-supplied URL or account.
 
-`extractContextFact` accepts bounded document bytes and a callback for the
-configured model. It checks the reviewed model, settings fingerprint,
-instructions version, one typed result, size, and uncertainty, then returns
-a fact resolution. The protected executor signs it as part of the Operation
-sent to the sidecar. The model supplies context, not a Rail decision.
-AuthRail receives bounded provenance and status, not the raw document or
-fact value. The callback must honor its abort signal; the SDK cannot forcibly
-stop an arbitrary callback that ignores cancellation.
+## Use AuthRail Contextual AI
 
-For the reviewed OpenAI Decisions source, use `gpt-6-luna` and one predicate,
-choice, or score question. Pin `openAIDecisionsConfigSha256(question)` as the
-Context Source Version's settings fingerprint before publishing it. The
-protected application uses that same reviewed question and supplies its own
-OpenAI key; the key and raw document never go to the agent, sidecar, or
-AuthRail server. For example:
+Enable **AuthRail Contextual AI** on a Guard or Policy Rail when the rule needs
+to understand meaning: a code change that weakens authentication, confidential
+material in an export, or the purpose described in a payment justification.
+Describe the business rule and review the prepared question, permitted fields
+and answer before testing and publishing that exact Rail version.
 
-```ts
-const question = { type: "predicate", instructions: "Does this message contain a payment card number?",
-  minConfidence: 0.8 } as const;
-if (openAIDecisionsConfigSha256(question) !== reviewedSource.modelConfigSha256) {
-  throw new Error("The reviewed contextual question has changed");
-}
-const extractor = newOpenAIDecisionsExtractor({ source: reviewedSource, question,
-  apiKey: openAiKeyHeldByApplication });
-const fact = await extractContextFact(reviewedSource, message.id, message.sourceLocation,
-  message.observedAt, message.bytes, extractor);
-operation.factResolutions = [fact];
-```
+The SDK handles the contextual request automatically during its normal call
+and result checks. It obtains the selected assessment from the local sidecar,
+selects only its permitted fields after required local processing, and sends
+them through the sidecar to AuthRail. AuthRail returns a signed bounded finding;
+the sidecar verifies its exact request, caller, material and Rail binding and
+applies the deterministic rule. You do not supply a model key, choose a model,
+write a prompt or initialise an extractor.
 
-The Decisions API receives only the bounded document text from this protected
-application. A refusal or a predicate probability between the reviewed true
-and false thresholds produces `uncertain`; a sufficiently low probability
-produces `false`. Choice and score answers below the confidence threshold are
-also `uncertain`. A timeout or provider failure produces `unavailable`.
-Neither status supplies a trusted fact. A sufficiently confident answer is
-still contextual input to the published Rail, never a final allow decision or
-independent proof that the model understood the document.
+With the setting off, that Rail sends no contextual request. Missing material,
+uncertainty or an unavailable service never becomes a made-up answer. Contextual
+AI cannot replace a trusted balance lookup, fix missing identity, override a
+denial or supply a required human approval.
+
+AuthRail receives the selected material for transient processing. It is not
+added to normal logs, traces or retained Actions; those retain the assessment
+status and bounded finding. Review permitted disclosure before publishing.
+See [Contextual AI](https://docs.authrail.io/docs/facts) for the full flow.
 
 ```ts
 const fact = await lookupCustomerFact(reviewedSource, invoice.id,

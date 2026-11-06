@@ -9,6 +9,7 @@ import {
   goJSON,
   jsonObject,
 } from './protocol.js';
+import { readContextual, type ContextualConnection } from './contextual.js';
 import type {
   JSONObject,
   Observation,
@@ -41,6 +42,7 @@ export class ObserveClient {
   #deploymentId: string;
   #privateKey: KeyObject;
   #fetch: typeof globalThis.fetch;
+  #contextual: ContextualConnection;
 
   constructor(config: ObserveClientConfig) {
     const url = new URL(config.sidecarUrl);
@@ -72,6 +74,9 @@ export class ObserveClient {
     this.#deploymentId = config.deploymentId;
     this.#privateKey = privateKey;
     this.#fetch = config.fetch ?? fetch;
+    this.#contextual = { sidecarUrl: url.origin, adapterToken: this.#token,
+      organisationId: this.#organisationId, deploymentId: this.#deploymentId,
+      executorPrivateKey: privateKey, fetch: this.#fetch };
   }
 
   /** Runs the protected function independently of the checks; read observation for coverage gaps. */
@@ -203,6 +208,7 @@ export class ObserveClient {
   /** Signs one phase; callers enforcing a decision must apply the outcome themselves. */
   async evaluate(call: ObservedCall, phase: Phase, expectedMode: 'observe' | 'enforce',
     result?: unknown): Promise<ObserveDecision> {
+    const contextualFindings = await readContextual(this.#contextual, call, phase, result);
     const attribution = {
       principalId: call.principalId,
       sessionId: call.sessionId,
@@ -247,6 +253,7 @@ export class ObserveClient {
       ...(call.factResolutions?.length ? { factResolutions: call.factResolutions } : {}),
       ...(call.trajectory ? { trajectory: call.trajectory } : {}),
       ...(call.guardEvidence?.length ? { guardEvidence: call.guardEvidence } : {}),
+      ...(contextualFindings.length ? { contextualFindings } : {}),
       attribution,
       ...(reviewSummarySha256 ? { reviewSummary: call.reviewSummary } : {}),
       identityProof: { issuedAt, expiresAt, signature },
