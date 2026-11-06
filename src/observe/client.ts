@@ -1,3 +1,4 @@
+import { registeredDataSources, resolveData, type DataSourceBinding } from './data.js';
 import { createHash, createPrivateKey, createPublicKey, KeyObject, randomUUID, sign } from 'node:crypto';
 import type { ObservedCall, Phase } from './protocol.js';
 import {
@@ -43,6 +44,8 @@ export class ObserveClient {
   #privateKey: KeyObject;
   #fetch: typeof globalThis.fetch;
   #contextual: ContextualConnection;
+  #dataSources: DataSourceBinding[] | undefined;
+  #dataCalls = new WeakMap<ObservedCall, ObservedCall>();
 
   constructor(config: ObserveClientConfig) {
     const url = new URL(config.sidecarUrl);
@@ -68,6 +71,7 @@ export class ObserveClient {
     if (privateKey.type !== 'private' || privateKey.asymmetricKeyType !== 'ed25519') {
       throw new Error('Executor key must be a private Ed25519 key');
     }
+    this.#dataSources = registeredDataSources(config.dataSources);
     this.#endpoint = new URL('/evaluate', url);
     this.#token = config.adapterToken;
     this.#organisationId = config.organisationId;
@@ -208,6 +212,11 @@ export class ObserveClient {
   /** Signs one phase; callers enforcing a decision must apply the outcome themselves. */
   async evaluate(call: ObservedCall, phase: Phase, expectedMode: 'observe' | 'enforce',
     result?: unknown): Promise<ObserveDecision> {
+    const originalCall = call;
+    const data = this.#dataSources !== undefined
+      ? await resolveData(this.#contextual, this.#dataSources, call, phase)
+      : { resolutions: call.factResolutions, bundleId: undefined, sequence: undefined };
+    call = { ...call, ...(data.resolutions ? { factResolutions: data.resolutions } : {}) };
     const contextualFindings = await readContextual(this.#contextual, call, phase, result);
     const attribution = {
       principalId: call.principalId,
@@ -292,8 +301,15 @@ export class ObserveClient {
     ) {
       throw new Error('Sidecar decision contract is invalid');
     }
+    if (data.bundleId && (!('bundleId' in decision) || decision.bundleId !== data.bundleId || !('sequence' in decision) || decision.sequence !== data.sequence)) {
+      throw new Error('Data source bundle changed');
+    }
+    if (phase === 'tool_call' && this.#dataSources !== undefined) this.#dataCalls.set(originalCall, call);
     return decision as ObserveDecision;
   }
+
+  /** Return the detached checked call, including facts bound into its signature and receipts. */
+  checkedCall(call: ObservedCall): ObservedCall { return this.#dataCalls.get(call) ?? call; }
 
   /** Claims an approved Action once. An uncertain response must be reconciled, never retried blindly. */
   async claimApproval(call: ObservedCall, decision: ObserveDecision): Promise<{
@@ -315,6 +331,7 @@ export class ObserveClient {
       !decision.approvalRequestId || !uuid.test(decision.approvalRequestId)) {
       throw new Error('A retained approval request is required');
     }
+    call = this.checkedCall(call);
     const inputSha256 = createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex');
     const publicKey = createPublicKey(this.#privateKey).export({ format: 'jwk' });
     if (typeof publicKey.x !== 'string') throw new Error('Executor key is invalid');
@@ -368,6 +385,7 @@ export class ObserveClient {
       (outcome.event.startsWith('reconciled_') && outcome.providerReference === null)) {
       throw new Error('Observed execution outcome is invalid');
     }
+    call = this.checkedCall(call);
     const inputSha256 = createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex');
     const publicKey = createPublicKey(this.#privateKey).export({ format: 'jwk' });
     if (typeof publicKey.x !== 'string') throw new Error('Executor key is invalid');

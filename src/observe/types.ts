@@ -1,4 +1,5 @@
 import type { KeyObject } from 'node:crypto';
+import type { DataSourceBinding } from './data.js';
 
 export type JSONValue =
   | string
@@ -119,6 +120,8 @@ export type ObserveClientConfig = {
   fetch?: typeof globalThis.fetch;
   /** Enforce runs exact matching handlers; Observe never processes inputs or results. */
   guardHandlers?: GuardHandler[];
+  /** Once-bound private readers; omitted preserves manual fact resolution. */
+  dataSources?: DataSourceBinding[];
 };
 
 /** Explicit executor knowledge of an advisory attempt; exceptions alone do not prove failure. */

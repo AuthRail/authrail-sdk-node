@@ -66,6 +66,7 @@ export class EnforceClient {
         call.operationVersionId, 'tool_call', call.arguments, this.#handlers);
       call = { ...call, arguments: processed.output, guardEvidence: processed.evidence };
       callDecision = await this.#sidecar.evaluate(call, 'tool_call', 'enforce');
+      call = this.#sidecar.checkedCall(call);
       if (callDecision.bundleId !== processed.bundleId || callDecision.sequence !== processed.sequence) {
         throw new Error('Guard bundle changed');
       }

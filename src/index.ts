@@ -27,3 +27,5 @@ export { newOpenAIDecisionsExtractor, openAIDecisionsConfigSha256 } from './cont
 export type { DecisionsQuestion } from './contextual-decisions.js';
 
 export type { ObservedCall } from './observe/protocol.js';
+
+export type { DataSourceBinding, DataResourceContext } from './observe/data.js';
