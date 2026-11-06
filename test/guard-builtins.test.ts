@@ -52,3 +52,37 @@ test('custom handlers cannot shadow a built-in at any version or kind', () => {
     }
   }
 });
+
+// Local processing must remove reviewed data before disclosure without classifying
+// ordinary identifiers, invalid numbers or unsupported forms as a passing detector.
+test('email, payment-card and unconditional withholding process both reviewed phases', async () => {
+  const handlers = [
+    { id: 'authrail_redact_email_v1', version: '9773bce1f804773de4e773f4fedbc3f8a15785d26e70e49ad7b600eb631ea49d', replacement: '[REDACTED]',
+      cases: [['Contact jane.doe+test@example.co.uk.', true], ['a@EXAMPLE.COM', true], ['a..b@example.com', false],
+        ['a.@example.com', false], ['a@example.c', false], ['_name@example.com', false],
+        ['name@example.com_', false], ['ordinary reply', false], [`${'a'.repeat(65)}@example.com`, false]] as Array<[string, boolean]> },
+    { id: 'authrail_redact_payment_card_v1', version: '01c828b26465d66ad89cb6a350c82d9afa1d8673ee8e167acfc33bde27c1535b', replacement: '[REDACTED]',
+      cases: [['Card 4111 1111 1111 1111.', true], ['378282246310005', true], ['4242-4242-4242-4242', true],
+        ['4111111111111112', false], ['0000000000000000', false], ['41111111111111111111', false],
+        ['４１１１１１１１１１１１１１１１', false], ['invoice 123456', false]] as Array<[string, boolean]> },
+    { id: 'authrail_withhold_field_v1', version: '3ebd6aaea66cbd30459938a624b0f74d6bea612e28d6638273a67145b2fe5555', replacement: '[WITHHELD]',
+      cases: [['protected instructions and arbitrary internal text', true], ['', true]] as Array<[string, boolean]> },
+  ];
+  for (const handler of handlers) {
+    for (const phase of ['tool_call', 'tool_result'] as const) {
+      for (const [text, found] of handler.cases) {
+        const processed = await processGuard({ formatVersion: 1, operationVersionId, phase,
+          bundleId, sequence: 1, coverage: 'evaluated', requirements: [{ railVersionId: bundleId,
+            ruleId: 'protect', kind: 'sanitize', handlerId: handler.id, handlerVersion: handler.version,
+            target: { root: phase === 'tool_call' ? 'arguments' : 'result', path: ['text'] },
+          }] }, operationVersionId, phase, { text, kept: true }, registeredHandlers(undefined));
+        const expected = found ? handler.replacement : text;
+        assert.deepEqual(processed.output, { text: expected, kept: true });
+        assert.equal(processed.evidence[0]?.inputSha256, hash(text));
+        assert.equal(processed.evidence[0]?.outputSha256, hash(expected));
+      }
+    }
+    assert.throws(() => registeredHandlers([{ id: handler.id, version: 'f'.repeat(64),
+      kind: 'sanitize', process: (value) => value }]));
+  }
+});

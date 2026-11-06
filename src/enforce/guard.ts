@@ -35,16 +35,58 @@ function redactCredentials(value: string): string {
     ? '[REDACTED]' : value;
 }
 
+const emailCandidates = /[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g;
+const cardCandidates = /[0-9](?:[0-9 -]*[0-9])?/g;
+
+function emailAddressV1(value: string): boolean {
+  for (const match of value.matchAll(emailCandidates)) {
+    const index = match.index;
+    if (/[A-Za-z0-9._%+@-]/.test(value[index - 1] ?? '') ||
+      /[A-Za-z0-9_@-]/.test(value[index + match[0].length] ?? '')) continue;
+    const [local, domain] = match[0].split('@') as [string, string];
+    const last = domain.slice(domain.lastIndexOf('.') + 1);
+    if (match[0].length <= 254 && !local.includes('..') && !local.endsWith('.') &&
+      /^[A-Za-z]{2,63}$/.test(last)) return true;
+  }
+  return false;
+}
+
+function paymentCardV1(value: string): boolean {
+  for (const match of value.matchAll(cardCandidates)) {
+    const digits = match[0].replace(/[ -]/g, '');
+    if (digits.length < 13 || digits.length > 19 || /^([0-9])\1+$/.test(digits)) continue;
+    let sum = 0;
+    for (let index = digits.length - 1, double = false; index >= 0; index--, double = !double) {
+      let digit = Number(digits[index]);
+      if (double) { digit *= 2; if (digit > 9) digit -= 9; }
+      sum += digit;
+    }
+    if (sum % 10 === 0) return true;
+  }
+  return false;
+}
+
+const localBuiltins: GuardHandler[] = [
+  { id: 'authrail_redact_email_v1', version: '9773bce1f804773de4e773f4fedbc3f8a15785d26e70e49ad7b600eb631ea49d',
+    kind: 'sanitize', process: (value) => emailAddressV1(value) ? '[REDACTED]' : value },
+  { id: 'authrail_redact_payment_card_v1', version: '01c828b26465d66ad89cb6a350c82d9afa1d8673ee8e167acfc33bde27c1535b',
+    kind: 'sanitize', process: (value) => paymentCardV1(value) ? '[REDACTED]' : value },
+  { id: 'authrail_withhold_field_v1', version: '3ebd6aaea66cbd30459938a624b0f74d6bea612e28d6638273a67145b2fe5555',
+    kind: 'sanitize', process: () => '[WITHHELD]' },
+];
+const reservedHandlerIds = new Set([credentialHandlerId, ...localBuiltins.map((handler) => handler.id)]);
+
 export function registeredHandlers(input: GuardHandler[] | undefined): Map<string, GuardHandler> {
   const builtin: GuardHandler = { id: credentialHandlerId, version: credentialHandlerVersion,
     kind: 'sanitize', process: redactCredentials };
   const handlers = new Map<string, GuardHandler>([
     [handlerKey(builtin.id, builtin.version, builtin.kind), builtin],
+    ...localBuiltins.map((handler): [string, GuardHandler] => [handlerKey(handler.id, handler.version, handler.kind), handler]),
   ]);
   if (input === undefined) return handlers;
   if (!Array.isArray(input) || input.length > 64) fail();
   for (const handler of input) {
-    if (!handler || handler.id === credentialHandlerId || !identifier.test(handler.id) || !digest.test(handler.version) ||
+    if (!handler || reservedHandlerIds.has(handler.id) || !identifier.test(handler.id) || !digest.test(handler.version) ||
       !['sanitize', 'transform'].includes(handler.kind) || typeof handler.process !== 'function') fail();
     const key = handlerKey(handler.id, handler.version, handler.kind);
     if (handlers.has(key)) fail();
