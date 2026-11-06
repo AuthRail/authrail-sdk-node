@@ -85,9 +85,24 @@ function client(fetchImpl: typeof fetch) {
   });
 }
 
+function defaultGuardSidecar(fetchImpl: typeof fetch): typeof fetch {
+  return async (url, init) => {
+    const endpoint = new URL(String(url));
+    if (endpoint.pathname === '/guard-requirements') {
+      const phase = endpoint.searchParams.get('phase') as 'tool_call' | 'tool_result';
+      return new Response(JSON.stringify(guardPlan(phase, [])));
+    }
+    const response = await fetchImpl(url, init);
+    if (endpoint.pathname !== '/evaluate' || !response.ok) return response;
+    const body = await response.json() as Record<string, unknown>;
+    return new Response(JSON.stringify({ bundleId: guardBundleId, sequence: 1, ...body }),
+      { status: response.status, headers: response.headers });
+  };
+}
+
 function enforceClient(fetchImpl: typeof fetch) {
   return new EnforceClient({ sidecarUrl: 'http://127.0.0.1:7078', adapterToken,
-    organisationId, deploymentId, executorPrivateKey: keys.privateKey, fetch: legacySidecar(fetchImpl) });
+    organisationId, deploymentId, executorPrivateKey: keys.privateKey, fetch: defaultGuardSidecar(legacySidecar(fetchImpl)) });
 }
 
 test('shared decision conformance fixtures gate protected effects', async () => {
@@ -981,4 +996,37 @@ test('observed execution evidence signs the original attempt and never requests 
   assert.deepEqual(await sdk.reportObservedExecution(call, { event: 'succeeded', providerIdempotencyKey: 'business-effect', providerReference: 'record_123' }), { recordingStatus: 'queued' });
   await assert.rejects(() => sdk.reportObservedExecution(call, { event: 'reconciled_succeeded', providerIdempotencyKey: 'business-effect', providerReference: null }));
   assert.equal(sends, 1);
+});
+
+// Security risk: a normal Enforce client must apply built-ins without customer registration.
+test('Enforce automatically applies built-in redaction before call and result checks', async () => {
+  const raw = `key: ghp_${'a'.repeat(36)}`;
+  const checked: Array<{ phase: string; arguments: JSONObject; result?: JSONObject; guardEvidence: GuardEvidence[] }> = [];
+  const adapter = new EnforceClient({ sidecarUrl: 'http://127.0.0.1:7078', adapterToken,
+    organisationId, deploymentId, executorPrivateKey: keys.privateKey,
+    fetch: legacySidecar(async (url, init) => {
+      const endpoint = new URL(String(url));
+      if (endpoint.pathname === '/guard-requirements') {
+        const phase = endpoint.searchParams.get('phase') as 'tool_call' | 'tool_result';
+        const requirement = { ...guardRequirement(phase), handlerId: 'authrail_redact_credentials_v1',
+          handlerVersion: 'cea4d8ac57cc39a33a9584742b56e412ff889026cb6b69b086bccbe4cc25d833' };
+        return new Response(JSON.stringify(guardPlan(phase, [requirement])));
+      }
+      if (endpoint.pathname === '/execution-receipts') return receiptResponse(init);
+      const body = JSON.parse(String(init?.body)) as typeof checked[number] & { requestId: string };
+      checked.push(body);
+      return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+        enforced: false, coverage: 'evaluated', outcome: 'allow', bundleId: guardBundleId,
+        sequence: 1, recordingStatus: 'retained', actionId, reportReplayed: false }));
+    }) });
+  const input = { text: raw };
+  const result = await adapter.enforce(operation(), input, (args) => {
+    assert.deepEqual(args, { text: '[REDACTED]' });
+    return { text: raw };
+  });
+  assert.deepEqual(input, { text: raw });
+  assert.deepEqual(result.result, { text: '[REDACTED]' });
+  assert.deepEqual(checked.map((entry) => entry.phase), ['tool_call', 'tool_result']);
+  assert.equal(checked[0]?.guardEvidence[0]?.outputSha256, hashString('[REDACTED]'));
+  assert.equal(checked[1]?.guardEvidence.length, 2);
 });

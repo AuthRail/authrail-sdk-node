@@ -41,7 +41,6 @@ export class EnforceOutcomeUnknownError extends Error {
 export class EnforceClient {
   readonly #sidecar: ObserveClient;
   readonly #handlers: Map<string, GuardHandler>;
-  readonly #guardProcessing: boolean;
   readonly #pending = new WeakMap<EnforceBlockedError,
     { call: ObservedCall; decision: ObserveDecision;
       execute: (checkedArguments: JSONObject, context: ExecutionContext) => JSONObject | Promise<JSONObject> }>();
@@ -49,7 +48,6 @@ export class EnforceClient {
   constructor(config: ObserveClientConfig) {
     this.#sidecar = new ObserveClient(config);
     this.#handlers = registeredHandlers(config.guardHandlers);
-    this.#guardProcessing = config.guardHandlers !== undefined;
   }
 
   async enforce<Result extends JSONObject>(
@@ -63,18 +61,12 @@ export class EnforceClient {
     catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
     let callDecision: ObserveDecision;
     try {
-      let bundleId: string | undefined;
-      let sequence: number | undefined;
-      if (this.#guardProcessing) {
-        const processed = await processGuard(
-          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_call', call.traceparent),
-          call.operationVersionId, 'tool_call', call.arguments, this.#handlers);
-        call = { ...call, arguments: processed.output, guardEvidence: processed.evidence };
-        bundleId = processed.bundleId;
-        sequence = processed.sequence;
-      }
+      const processed = await processGuard(
+        await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_call', call.traceparent),
+        call.operationVersionId, 'tool_call', call.arguments, this.#handlers);
+      call = { ...call, arguments: processed.output, guardEvidence: processed.evidence };
       callDecision = await this.#sidecar.evaluate(call, 'tool_call', 'enforce');
-      if (bundleId && (callDecision.bundleId !== bundleId || callDecision.sequence !== sequence)) {
+      if (callDecision.bundleId !== processed.bundleId || callDecision.sequence !== processed.sequence) {
         throw new Error('Guard bundle changed');
       }
     } catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
@@ -208,22 +200,15 @@ export class EnforceClient {
     }
     let resultDecision: ObserveDecision;
     try {
-      let resultCall = call;
-      let bundleId: string | undefined;
-      let sequence: number | undefined;
-      if (this.#guardProcessing) {
-        const processed = await processGuard(
-          await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_result', call.traceparent),
-          call.operationVersionId, 'tool_result', result, this.#handlers);
-        const guardEvidence = [...(call.guardEvidence ?? []), ...processed.evidence];
-        if (guardEvidence.length > 128) throw new Error('Guard processing evidence is too large');
-        resultCall = { ...call, guardEvidence };
-        result = processed.output as Result;
-        bundleId = processed.bundleId;
-        sequence = processed.sequence;
-      }
+      const processed = await processGuard(
+        await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_result', call.traceparent),
+        call.operationVersionId, 'tool_result', result, this.#handlers);
+      const guardEvidence = [...(call.guardEvidence ?? []), ...processed.evidence];
+      if (guardEvidence.length > 128) throw new Error('Guard processing evidence is too large');
+      const resultCall = { ...call, guardEvidence };
+      result = processed.output as Result;
       resultDecision = await this.#sidecar.evaluate(resultCall, 'tool_result', 'enforce', result);
-      if (bundleId && (resultDecision.bundleId !== bundleId || resultDecision.sequence !== sequence)) {
+      if (resultDecision.bundleId !== processed.bundleId || resultDecision.sequence !== processed.sequence) {
         throw new Error('Guard bundle changed');
       }
     } catch (cause) { throw new EnforceBlockedError('tool_result', true, null, cause); }

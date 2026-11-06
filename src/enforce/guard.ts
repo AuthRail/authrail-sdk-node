@@ -23,12 +23,28 @@ const handlerKey = (id: string, version: string, kind: string) => `${id}:${versi
 const requirementKey = (value: Requirement) =>
   `${handlerKey(value.handlerId, value.handlerVersion, value.kind)}:${goJSON(value.target)}`;
 
+const credentialHandlerId = 'authrail_redact_credentials_v1';
+const credentialHandlerVersion = 'cea4d8ac57cc39a33a9584742b56e412ff889026cb6b69b086bccbe4cc25d833';
+const privateKeyMarkers = ['PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY', 'OPENSSH PRIVATE KEY']
+  .map((label) => `-----BEGIN ${label}-----`);
+const credentialToken = /(?:^|[^A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}|(?:AKIA|ASIA)[A-Z0-9]{16})(?:$|[^A-Za-z0-9_])/;
+
+// Version one removes the whole reviewed field, never just a possibly incomplete match.
+function redactCredentials(value: string): string {
+  return privateKeyMarkers.some((marker) => value.includes(marker)) || credentialToken.test(value)
+    ? '[REDACTED]' : value;
+}
+
 export function registeredHandlers(input: GuardHandler[] | undefined): Map<string, GuardHandler> {
-  const handlers = new Map<string, GuardHandler>();
+  const builtin: GuardHandler = { id: credentialHandlerId, version: credentialHandlerVersion,
+    kind: 'sanitize', process: redactCredentials };
+  const handlers = new Map<string, GuardHandler>([
+    [handlerKey(builtin.id, builtin.version, builtin.kind), builtin],
+  ]);
   if (input === undefined) return handlers;
   if (!Array.isArray(input) || input.length > 64) fail();
   for (const handler of input) {
-    if (!handler || !identifier.test(handler.id) || !digest.test(handler.version) ||
+    if (!handler || handler.id === credentialHandlerId || !identifier.test(handler.id) || !digest.test(handler.version) ||
       !['sanitize', 'transform'].includes(handler.kind) || typeof handler.process !== 'function') fail();
     const key = handlerKey(handler.id, handler.version, handler.kind);
     if (handlers.has(key)) fail();
