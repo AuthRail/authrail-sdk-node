@@ -230,6 +230,31 @@ test('Enforce runs only after a retained allow and checks the result before expo
   assert.deepEqual(completed.result, { status: 'paid' });
 });
 
+// A slow retained decision must finish before, and never duplicate, the business callback.
+test('Enforce waits through a transient recording delay before executing once', async () => {
+  let effects = 0;
+  let retained = false;
+  const adapter = enforceClient(async (url, init) => {
+    if (new URL(String(url)).pathname === '/execution-receipts') return receiptResponse(init);
+    const body = requestBody(init);
+    if (body.phase === 'tool_call') {
+      await new Promise<void>((resolve, reject) => {
+        const signal = init?.signal;
+        const abort = () => { clearTimeout(timer); reject(signal?.reason); };
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, 4500);
+        signal?.addEventListener('abort', abort, { once: true });
+      });
+      assert.equal(effects, 0);
+      retained = true;
+    }
+    return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+      enforced: false, coverage: 'evaluated', outcome: 'allow',
+      recordingStatus: 'retained', reportReplayed: false, actionId }), { status: 200 });
+  });
+  await adapter.enforce(operation(), {}, () => { assert.equal(retained, true); effects++; return {}; });
+  assert.equal(effects, 1);
+});
+
 test('Enforce signs the bounded human summary only on the call', async () => {
   let checked = 0;
   const adapter = enforceClient(async (_url, init) => {

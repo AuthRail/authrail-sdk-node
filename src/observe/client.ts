@@ -277,7 +277,9 @@ export class ObserveClient {
         ...(call.traceparent ? { traceparent: call.traceparent } : {}),
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(expectedMode === 'enforce' ? 4000 : 2000),
+      // Enforce waits for durable decision delivery before the protected function runs.
+      // Leave room for the sidecar's bounded recording window; Observe stays short.
+      signal: AbortSignal.timeout(expectedMode === 'enforce' ? 10000 : 2000),
     });
     if (response.status !== 200) throw new Error(`Sidecar returned HTTP ${response.status}`);
     const decision = await boundedJSON(response);
