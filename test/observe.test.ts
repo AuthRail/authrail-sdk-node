@@ -28,6 +28,42 @@ const adapterToken = 'abcdefghijklmnopqrstuvwxyz012345';
 const keys = generateKeyPairSync('ed25519');
 const actionId = '00000000-0000-4000-8000-000000000004';
 
+test('bounded arguments and result share a larger evaluation envelope over loopback HTTP', async () => {
+  const padding = { value: 'x'.repeat(64 * 1024 - Buffer.byteLength('{"value":""}')) };
+  let requests = 0;
+  const server = createServer(async (request, response) => {
+    if (new URL(request.url ?? '/', 'http://127.0.0.1').pathname === '/contextual-requirements') {
+      response.writeHead(404).end();
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const raw = Buffer.concat(chunks);
+    assert.ok(raw.byteLength > 128 * 1024);
+    assert.ok(raw.byteLength <= 512 * 1024);
+    const body = JSON.parse(raw.toString()) as RequestBody & { result: JSONObject };
+    assert.deepEqual(body.arguments, padding);
+    assert.deepEqual(body.result, padding);
+    requests++;
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ requestId: body.requestId, mode: 'observe', enforced: false,
+      coverage: 'uncovered', outcome: 'additional_context_required' }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+    const sdk = new ObserveClient({ sidecarUrl: `http://127.0.0.1:${address.port}`,
+      adapterToken, organisationId, deploymentId, executorPrivateKey: keys.privateKey });
+    const result = await sdk.evaluate(sdk.prepare(operation(), padding), 'tool_result', 'observe', padding);
+    assert.equal(result.coverage, 'uncovered');
+    assert.equal(requests, 1);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 function receiptResponse(init: RequestInit | undefined, events?: string[]): Response {
   const body = JSON.parse(String(init?.body)) as { actionId: string; attemptId: string;
     permitId: string | null; event: string; inputSha256: string;

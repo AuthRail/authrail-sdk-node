@@ -39,4 +39,13 @@ assert.equal(resumed.resultDecision.outcome, 'approval_required');
 await assert.rejects(restarted.recoverApprovalFrom(stored, () => { effects++; return {}; }),
   (error) => error instanceof EnforceBlockedError && error.phase === 'tool_call');
 assert.equal(effects, 2);
+const nearLimitInput = { amount: 80, padding: '' };
+nearLimitInput.padding = 'x'.repeat(64 * 1024 - Buffer.byteLength(JSON.stringify(nearLimitInput)));
+const nearLimitOutput = { padding: 'x'.repeat(64 * 1024 - Buffer.byteLength('{"padding":""}')) };
+const bounded = await adapter.enforce({ ...config.operation, actionKey: 'node-bounded-envelope' }, nearLimitInput,
+  (input) => { assert.deepEqual(input, nearLimitInput); effects++; return nearLimitOutput; });
+assert.deepEqual(bounded.result, nearLimitOutput);
+assert.equal(bounded.resultDecision.recordingStatus, 'retained');
+assert.equal(effects, 3);
 console.log('Node: real sidecar allowed call/result, denial with no effect, persisted permit recovery, and duplicate-start blocking passed.');
+console.log('Node: near64KiB arguments/result retained through real sidecar after one protected callback.');

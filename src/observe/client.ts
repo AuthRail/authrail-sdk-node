@@ -9,6 +9,7 @@ import {
   freezeContext,
   goJSON,
   jsonObject,
+  MAX_EVALUATION_REQUEST_BYTES,
 } from './protocol.js';
 import { readContextual, type ContextualConnection } from './contextual.js';
 import type {
@@ -267,6 +268,10 @@ export class ObserveClient {
       ...(reviewSummarySha256 ? { reviewSummary: call.reviewSummary } : {}),
       identityProof: { issuedAt, expiresAt, signature },
     };
+    const encoded = JSON.stringify(body);
+    if (Buffer.byteLength(encoded) > MAX_EVALUATION_REQUEST_BYTES) {
+      throw new Error('Evaluation request exceeds its size limit');
+    }
     const response = await this.#fetch(this.#endpoint, {
       method: 'POST',
       redirect: 'manual',
@@ -276,7 +281,7 @@ export class ObserveClient {
         'Content-Type': 'application/json',
         ...(call.traceparent ? { traceparent: call.traceparent } : {}),
       },
-      body: JSON.stringify(body),
+      body: encoded,
       // Enforce waits for durable decision delivery before the protected function runs.
       // Leave room for the sidecar's bounded recording window; Observe stays short.
       signal: AbortSignal.timeout(expectedMode === 'enforce' ? 10000 : 2000),

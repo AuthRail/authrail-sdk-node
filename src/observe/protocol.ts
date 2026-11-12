@@ -1,6 +1,7 @@
 import type { FactResolution, GuardEvidence, JSONObject, ObserveOperation, TrajectorySnapshot } from './types.js';
 
 export type Phase = 'tool_call' | 'tool_result';
+export const MAX_EVALUATION_REQUEST_BYTES = 512 * 1024;
 export type ObservedCall = ObserveOperation & { arguments: JSONObject; requestId: string; guardEvidence?: GuardEvidence[] };
 type Field = [string, string];
 
