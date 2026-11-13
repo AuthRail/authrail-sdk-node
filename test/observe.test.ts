@@ -4,7 +4,7 @@ import { createHash, generateKeyPairSync, randomUUID, verify } from 'node:crypto
 import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { EnforceBlockedError, EnforceClient, EnforceOutcomeUnknownError, ObserveClient } from '../src/index.js';
-import type { GuardEvidence, GuardHandler, JSONObject, ObserveOperation } from '../src/index.js';
+import type { ExecutionContext, ExecutionOptions, GuardEvidence, GuardHandler, JSONObject, ObserveOperation } from '../src/index.js';
 import { encodeInput, goJSON } from '../src/observe/protocol.js';
 import type { ObservedCall } from '../src/observe/protocol.js';
 
@@ -260,9 +260,18 @@ test('Enforce runs only after a retained allow and checks the result before expo
     args.invoiceId = 'local-working-copy';
     execution.actionId = 'local-working-copy';
     return { status: 'paid' };
-  });
+  }, { executionCheckpoint: async (context) => {
+    assert.equal(context.actionId, actionId);
+    assert.equal(context.attemptId, callRequestId);
+    assert.equal(context.permitId, null);
+    assert.equal(context.inputSha256, createHash('sha256').update('{"arguments":{"invoiceId":"invoice_123"}}').digest('hex'));
+    assert.equal(context.providerIdempotencyKey, `ar-${actionId}`);
+    assert.equal(context.traceparent, traceparent);
+    assert.equal(Reflect.set(context, 'actionId', 'changed-by-checkpoint'), false);
+    phases.push('checkpoint');
+  } });
   assert.equal(effects, 1);
-  assert.deepEqual(phases, ['tool_call', 'started', 'succeeded', 'tool_result']);
+  assert.deepEqual(phases, ['tool_call', 'checkpoint', 'started', 'succeeded', 'tool_result']);
   assert.deepEqual(completed.result, { status: 'paid' });
 });
 
@@ -392,22 +401,74 @@ test('Enforce preserves an uncertain tool outcome for reconciliation', async () 
   assert.deepEqual(events, ['started', 'unknown']);
 });
 
-test('Enforce does not call the provider when the start receipt is uncertain', async () => {
-  let effects = 0;
+test('Enforce preserves recovery for lost, invalid and replayed starts without calling the provider', async () => {
+  for (const failure of ['lost', 'invalid', 'replayed']) {
+    let effects = 0;
+    let checkpoint: Readonly<ExecutionContext> | undefined;
+    const adapter = enforceClient(async (url, init) => {
+      if (new URL(String(url)).pathname === '/execution-receipts') {
+        assert.ok(checkpoint);
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        assert.equal(body.actionId, checkpoint.actionId);
+        assert.equal(body.attemptId, checkpoint.attemptId);
+        assert.equal(body.inputSha256, checkpoint.inputSha256);
+        assert.equal(body.executionCheckpoint, undefined);
+        if (failure === 'lost') throw new Error('receipt response lost');
+        return new Response(JSON.stringify(failure === 'invalid' ? {} :
+          { receiptId: randomUUID(), state: 'executing', replayed: true }), { status: 201 });
+      }
+      const body = requestBody(init);
+      return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
+        enforced: false, coverage: 'evaluated', outcome: 'allow',
+        recordingStatus: 'retained', reportReplayed: false, actionId }), { status: 200 });
+    });
+    await assert.rejects(adapter.enforce(operation(), {}, () => {
+      effects++; return { paid: true };
+    }, { executionCheckpoint: async (context) => { checkpoint = context; } }), (error) => {
+      assert.ok(error instanceof EnforceOutcomeUnknownError, failure);
+      assert.deepEqual(error.recovery, checkpoint);
+      assert.equal(error.recovery?.actionId, actionId);
+      assert.equal(error.recovery.providerIdempotencyKey, `ar-${actionId}`);
+      return true;
+    });
+    assert.equal(effects, 0, failure);
+  }
+});
+
+test('request-scoped checkpoint is awaited and failure blocks start without affecting another request', { timeout: 5000 }, async () => {
+  const events: string[] = [];
   const adapter = enforceClient(async (url, init) => {
-    if (new URL(String(url)).pathname === '/execution-receipts') {
-      throw new Error('receipt response lost');
-    }
+    if (new URL(String(url)).pathname === '/execution-receipts') return receiptResponse(init, events);
     const body = requestBody(init);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated', outcome: 'allow',
       recordingStatus: 'retained', reportReplayed: false, actionId }), { status: 200 });
   });
-  await assert.rejects(adapter.enforce(operation(), {}, () => {
-    effects++; return { paid: true };
-  }), (error) => error instanceof EnforceBlockedError &&
-    error.phase === 'tool_call' && !error.effectMayHaveOccurred);
-  assert.equal(effects, 0);
+  let enterCheckpoint: () => void = () => {};
+  const entered = new Promise<void>((resolve) => { enterCheckpoint = resolve; });
+  let releaseCheckpoint: () => void = () => {};
+  const release = new Promise<void>((resolve) => { releaseCheckpoint = resolve; });
+  const unavailable = new Error('durable save unavailable');
+  const options: ExecutionOptions = { executionCheckpoint: async () => {
+    enterCheckpoint();
+    await release;
+    throw unavailable;
+  } };
+  let effects = 0;
+  const pending = adapter.enforce(operation(), {}, () => { effects++; return {}; }, options);
+  const rejected = assert.rejects(pending, (error) => error instanceof EnforceBlockedError &&
+    error.phase === 'tool_call' && !error.effectMayHaveOccurred && error.cause === unavailable);
+  try {
+    await entered;
+    assert.deepEqual(events, []);
+    assert.equal(effects, 0);
+    await adapter.enforce({ ...operation(), actionKey: 'independent-request' }, {}, () => { effects++; return {}; });
+  } finally {
+    releaseCheckpoint();
+    await rejected;
+  }
+  assert.deepEqual(events, ['started', 'succeeded']);
+  assert.equal(effects, 1);
 });
 
 test('reconciliation signs the caller-reported provider outcome without rerunning the function', async () => {
@@ -429,11 +490,17 @@ test('reconciliation signs the caller-reported provider outcome without rerunnin
 test('approval resumes the original call only after a one-use claim', async () => {
   const approvalRequestId = randomUUID();
   const permitId = randomUUID();
+  let checkpoint: Readonly<ExecutionContext> | undefined;
   const requests: string[] = [];
   const adapter = enforceClient(async (url, init) => {
     const path = new URL(String(url)).pathname;
     requests.push(path);
-    if (path === '/execution-receipts') return receiptResponse(init);
+    if (path === '/execution-receipts') {
+      const receipt = JSON.parse(String(init?.body)) as { permitId: string; attemptId: string };
+      assert.equal(checkpoint?.permitId, receipt.permitId);
+      assert.equal(checkpoint?.attemptId, receipt.attemptId);
+      return receiptResponse(init);
+    }
     if (path === '/approval-permits/claim') {
       const claim = JSON.parse(String(init?.body)) as { actionId: string;
         approvalRequestId: string; proof: { signature: string; issuedAt: number;
@@ -467,7 +534,7 @@ test('approval resumes the original call only after a one-use claim', async () =
   }
   assert.ok(blocked);
   assert.equal(effects, 0);
-  const resumed = await adapter.resumeApproval(blocked);
+  const resumed = await adapter.resumeApproval(blocked, { executionCheckpoint: async (context) => { checkpoint = context; } });
   assert.equal(resumed.permitId, permitId);
   assert.equal(effects, 1);
   assert.deepEqual(requests, ['/evaluate', '/approval-permits/claim',
@@ -479,6 +546,7 @@ test('approval resumes the original call only after a one-use claim', async () =
 test('approval continuation accepts a retained result for the same approved Action', async () => {
   const approvalRequestId = randomUUID();
   const permitId = randomUUID();
+  let checkpoint: Readonly<ExecutionContext> | undefined;
   let claims = 0;
   let effects = 0;
   const provider = async (url: RequestInfo | URL, init?: RequestInit) => {
@@ -488,7 +556,12 @@ test('approval continuation accepts a retained result for the same approved Acti
       return new Response(JSON.stringify({ permitId, actionId,
         expiresAt: new Date(Date.now() + 20_000).toISOString() }), { status: 201 });
     }
-    if (path === '/execution-receipts') return receiptResponse(init);
+    if (path === '/execution-receipts') {
+      const receipt = JSON.parse(String(init?.body)) as { permitId: string; attemptId: string };
+      assert.equal(checkpoint?.permitId, receipt.permitId);
+      assert.equal(checkpoint?.attemptId, receipt.attemptId);
+      return receiptResponse(init);
+    }
     const body = requestBody(init);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated',
@@ -510,7 +583,7 @@ test('approval continuation accepts a retained result for the same approved Acti
   const resumed = await enforceClient(provider).resumeApprovalFrom(stored, () => {
     effects++;
     return { paid: true };
-  });
+  }, { executionCheckpoint: async (context) => { checkpoint = context; } });
   assert.equal(resumed.permitId, permitId);
   assert.equal(claims, 1);
   assert.equal(effects, 1);
@@ -543,6 +616,7 @@ test('an uncertain approval claim never runs or retries the protected callback',
 test('lost approval claim response resumes only through an exact existing permit read', async () => {
   const approvalRequestId = randomUUID();
   const permitId = randomUUID();
+  let checkpoint: Readonly<ExecutionContext> | undefined;
   let claims = 0;
   let reads = 0;
   let effects = 0;
@@ -557,7 +631,12 @@ test('lost approval claim response resumes only through an exact existing permit
       return new Response(JSON.stringify({ permitId, actionId,
         expiresAt: new Date(Date.now() + 20_000).toISOString() }), { status: 200 });
     }
-    if (path === '/execution-receipts') return receiptResponse(init);
+    if (path === '/execution-receipts') {
+      const receipt = JSON.parse(String(init?.body)) as { permitId: string; attemptId: string };
+      assert.equal(checkpoint?.permitId, receipt.permitId);
+      assert.equal(checkpoint?.attemptId, receipt.attemptId);
+      return receiptResponse(init);
+    }
     const body = requestBody(init);
     return new Response(JSON.stringify({ requestId: body.requestId, mode: 'enforce',
       enforced: false, coverage: 'evaluated',
@@ -578,7 +657,8 @@ test('lost approval claim response resumes only through an exact existing permit
     () => { effects++; return { paid: true }; }), EnforceBlockedError);
   assert.equal(effects, 0);
   const resumed = await enforceClient(provider).recoverApprovalFrom(continuation,
-    () => { effects++; return { paid: true }; });
+    () => { effects++; return { paid: true }; },
+    { executionCheckpoint: async (context) => { checkpoint = context; } });
   assert.equal(resumed.permitId, permitId);
   assert.equal(claims, 1);
   assert.equal(reads, 1);

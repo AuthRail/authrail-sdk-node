@@ -37,7 +37,7 @@ uses this release with a simple Policy Rail and a local invoice reader.
 
 Some sections below also describe newer repository source. Automatic
 Rail-owned Contextual AI, expanded built-in Guards and automatic Data reader
-bindings are not part of SDK 0.1.1. Check
+bindings and execution checkpoints are not part of SDK 0.1.1. Check
 [compatibility](https://docs.authrail.io/docs/compatibility) before enabling those
 requirements. The setup executable and native Runtime are version **0.2.0**,
 while its Docker installer selects Runtime **0.1.0**; they have separate version
@@ -376,8 +376,20 @@ needs its own key.
 `EnforceBlockedError` identifies whether the call or result check stopped.
 For a result block, `effectMayHaveOccurred` is true because the function has
 already run. A callback error or lost completion acknowledgement instead raises
-`EnforceOutcomeUnknownError` with `recovery` information. Save that information
-with the provider request so it survives process loss.
+`EnforceOutcomeUnknownError` with `recovery` information. In current source,
+missing, invalid or replayed execution-start acknowledgements also raise this
+error while withholding the callback. Unknown does not establish that an effect
+occurred. Save the recovery identity so the original attempt can be inspected.
+
+Current source, unreleased in 0.1.1, accepts optional per-call
+`ExecutionOptions.executionCheckpoint`. The SDK awaits this application-owned
+save before requesting execution start. It receives a frozen copy of the exact
+Action, attempt, permit, input digest, provider idempotency key and trace reference.
+A rejected save blocks start and execution. The option also applies to
+`resumeApproval`, `resumeApprovalFrom` and `recoverApprovalFrom`; it never changes
+other requests on the client. The application chooses protected durable storage
+and bounds its save operation. The SDK does not store in PostgreSQL or supply
+hosted shared-store/worker integration automatically.
 
 Use the saved idempotency key to establish the provider outcome, then call
 `authrail.reconcile({ ...error.recovery, providerReference, outcome: "succeeded" })`

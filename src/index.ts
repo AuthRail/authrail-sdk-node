@@ -1,6 +1,6 @@
 export { ObserveClient } from './observe/client.js';
 export { EnforceClient, EnforceBlockedError, EnforceOutcomeUnknownError } from './enforce/client.js';
-export type { ApprovalContinuation, ExecutionContext } from './enforce/client.js';
+export type { ApprovalContinuation, ExecutionContext, ExecutionCheckpoint, ExecutionOptions } from './enforce/client.js';
 export type {
   ExtractionProvenance,
   GuardHandler,

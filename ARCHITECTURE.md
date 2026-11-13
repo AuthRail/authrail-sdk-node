@@ -20,8 +20,13 @@ endpoint.
 
 The SDK does not independently establish that an application claim is true or
 that every action passed through the hook. Observe never blocks the function.
-Enforce requires a covered, centrally retained allow and an authenticated
-`started` receipt before invoking the callback. The callback receives a stable
+Enforce requires a covered, centrally retained allow and a fresh authenticated
+`started` receipt before invoking the callback. Optional per-call execution
+checkpoints let the application durably save a frozen recovery identity before
+the start request. A failed save prevents start; missing, invalid or replayed
+start acknowledgements withhold the callback and preserve unknown ownership.
+These options are private application callbacks, never protocol fields or a
+storage implementation supplied by the SDK. The callback receives a stable
 provider idempotency reference derived from the Action. The SDK reports
 completion or uncertainty separately from the result check; a failed result
 check cannot undo an effect. Missing or invalid checks never become allow

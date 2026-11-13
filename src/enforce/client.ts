@@ -26,7 +26,7 @@ export type ApprovalContinuation = {
   decision: ObserveDecision;
 };
 
-/** The protected function failed after permission; its external effect is unknown. */
+/** Execution ownership or its external outcome is uncertain; never retry the effect blindly. */
 export class EnforceOutcomeUnknownError extends Error {
   readonly effectMayHaveOccurred = true;
 
@@ -54,7 +54,9 @@ export class EnforceClient {
     operation: ObserveOperation,
     argumentsValue: JSONObject,
     execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
+    options?: ExecutionOptions,
   ): Promise<{ result: Result; callDecision: ObserveDecision; resultDecision: ObserveDecision }> {
+    const checkpoint = options?.executionCheckpoint;
     if (typeof execute !== 'function') throw new Error('Protected tool function is required');
     let call;
     try { call = this.#sidecar.prepare(operation, argumentsValue); }
@@ -84,14 +86,16 @@ export class EnforceClient {
       throw blocked;
     }
 
-    const { result, resultDecision } = await this.#execute(call, execute, callDecision, null);
+    const { result, resultDecision } = await this.#execute(call, execute, callDecision, null, checkpoint);
     return { result, callDecision, resultDecision };
   }
 
   /** Resumes the original protected function only after a one-use permit claim. */
   async resumeApproval(
     blocked: EnforceBlockedError,
+    options?: ExecutionOptions,
   ): Promise<{ result: JSONObject; permitId: string; resultDecision: ObserveDecision }> {
+    const checkpoint = options?.executionCheckpoint;
     const pending = this.#pending.get(blocked);
     if (!pending) {
       throw new EnforceBlockedError('tool_call', false, blocked.decision);
@@ -104,7 +108,7 @@ export class EnforceClient {
       throw new EnforceBlockedError('tool_call', false, pending.decision);
     }
     const { result, resultDecision } = await this.#execute(
-      pending.call, pending.execute, pending.decision, permit.permitId);
+      pending.call, pending.execute, pending.decision, permit.permitId, checkpoint);
     return { result, permitId: permit.permitId, resultDecision };
   }
 
@@ -112,7 +116,9 @@ export class EnforceClient {
   async resumeApprovalFrom<Result extends JSONObject>(
     continuation: ApprovalContinuation,
     execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
+    options?: ExecutionOptions,
   ): Promise<{ result: Result; permitId: string; resultDecision: ObserveDecision }> {
+    const checkpoint = options?.executionCheckpoint;
     if (typeof execute !== 'function' || !continuation ||
       !continuation.call || !continuation.decision) {
       throw new EnforceBlockedError('tool_call', false, null);
@@ -124,7 +130,7 @@ export class EnforceClient {
     if (Date.parse(permit.expiresAt) <= Date.now()) {
       throw new EnforceBlockedError('tool_call', false, decision);
     }
-    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId);
+    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId, checkpoint);
     return { result, permitId: permit.permitId, resultDecision };
   }
 
@@ -132,7 +138,9 @@ export class EnforceClient {
   async recoverApprovalFrom<Result extends JSONObject>(
     continuation: ApprovalContinuation,
     execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
+    options?: ExecutionOptions,
   ): Promise<{ result: Result; permitId: string; resultDecision: ObserveDecision }> {
+    const checkpoint = options?.executionCheckpoint;
     if (typeof execute !== 'function' || !continuation ||
       !continuation.call || !continuation.decision) {
       throw new EnforceBlockedError('tool_call', false, null);
@@ -144,7 +152,7 @@ export class EnforceClient {
     if (Date.parse(permit.expiresAt) <= Date.now()) {
       throw new EnforceBlockedError('tool_call', false, decision);
     }
-    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId);
+    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId, checkpoint);
     return { result, permitId: permit.permitId, resultDecision };
   }
 
@@ -162,11 +170,15 @@ export class EnforceClient {
 
   async #execute<Result extends JSONObject>(call: ObservedCall,
     execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
-    decision: ObserveDecision, permitId: string | null) {
+    decision: ObserveDecision, permitId: string | null, checkpoint?: ExecutionCheckpoint) {
     if (!decision.actionId) throw new EnforceBlockedError('tool_call', false, decision);
     const recovery = { actionId: decision.actionId, attemptId: call.requestId, permitId,
       inputSha256: createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex'),
       providerIdempotencyKey: `ar-${decision.actionId}`, traceparent: call.traceparent };
+    try {
+      // Persist a detached identity before a start request can become uncertain.
+      if (checkpoint !== undefined) await checkpoint(Object.freeze({ ...recovery }));
+    } catch (cause) { throw new EnforceBlockedError('tool_call', false, decision, cause); }
     try {
       const started = await this.#sidecar.reportExecution({ ...recovery,
         event: 'started', providerReference: null });
@@ -174,8 +186,8 @@ export class EnforceClient {
         throw new Error('Execution start was not fresh');
       }
     } catch (cause) {
-      // A lost acknowledgement cannot authorize a provider call.
-      throw new EnforceBlockedError('tool_call', false, decision, cause);
+      // A lost or replayed start withholds this callback but retains original work identity.
+      throw new EnforceOutcomeUnknownError(cause, recovery, decision);
     }
     // Only the protected application receives this callback and provider credentials.
     // The SDK cannot prove that a separate agent path cannot reach the same effect.
@@ -224,6 +236,12 @@ export class EnforceClient {
 export type ExecutionContext = { actionId: string; attemptId: string;
   permitId: string | null; inputSha256: string; providerIdempotencyKey: string;
   traceparent?: string };
+
+/** Save only in protected application storage; a rejection prevents execution start. */
+export type ExecutionCheckpoint = (context: Readonly<ExecutionContext>) => void | Promise<void>;
+
+/** Per-invocation persistence; never changes other requests on the same client. */
+export type ExecutionOptions = { executionCheckpoint?: ExecutionCheckpoint };
 
 function permitted(decision: ObserveDecision): boolean {
   return decision.mode === 'enforce' && decision.enforced === false &&
