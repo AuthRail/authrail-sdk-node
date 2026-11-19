@@ -77,7 +77,7 @@ function receiptResponse(init: RequestInit | undefined, events?: string[]): Resp
     inputSha256: body.inputSha256,
     providerIdempotencyKey: body.providerIdempotencyKey,
     providerReference: body.providerReference, keySha256: body.keySha256,
-    issuedAt: body.proof.issuedAt, expiresAt: body.proof.expiresAt });
+    issuedAt: body.proof.issuedAt, expiresAt: body.proof.expiresAt }).replace(/[<>&\u2028\u2029]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`);
   assert.equal(verify(null, Buffer.from(statement), keys.publicKey,
     Buffer.from(body.proof.signature, 'base64url')), true);
   events?.push(body.event);
@@ -1170,4 +1170,100 @@ test('Enforce automatically applies built-in redaction before call and result ch
   assert.deepEqual(checked.map((entry) => entry.phase), ['tool_call', 'tool_result']);
   assert.equal(checked[0]?.guardEvidence[0]?.outputSha256, hashString('[REDACTED]'));
   assert.equal(checked[1]?.guardEvidence.length, 2);
+});
+
+// Renewal can happen between preparation and evaluation, including after the effect.
+// Only a typed pre-retention conflict may reprepare; the business callback stays single-use.
+test('configuration renewal retries preparation once from original input and never repeats the effect', async () => {
+  let bundleId = guardBundleId, sequence = 1, effects = 0;
+  const attempts = { tool_call: 0, tool_result: 0 };
+  const sdk = processingClient(async (url, init) => {
+    const path = new URL(String(url));
+    if (path.pathname === '/guard-requirements') {
+      const phase = path.searchParams.get('phase') as 'tool_call' | 'tool_result';
+      return Response.json({ ...guardPlan(phase), bundleId, sequence });
+    }
+    if (path.pathname === '/execution-receipts') return receiptResponse(init);
+    const body = JSON.parse(String(init?.body)) as RequestBody & { expectedBundle: { bundleId: string; sequence: number }; guardEvidence: GuardEvidence[]; result?: JSONObject };
+    assert.deepEqual(body.expectedBundle, { bundleId, sequence });
+    assert.equal(body.arguments.text, 'input!');
+    attempts[body.phase]++;
+    if (attempts[body.phase] === 1) {
+      bundleId = randomUUID(); sequence++;
+      return Response.json({ code: 'configuration_changed' }, { status: 409 });
+    }
+    if (body.phase === 'tool_result') {
+      assert.equal(body.result?.text, 'output!');
+      assert.ok(body.guardEvidence.every(proof => proof.bundleId === bundleId));
+    }
+    return Response.json({ requestId: body.requestId, mode: 'enforce', enforced: false,
+      coverage: 'evaluated', outcome: 'allow', recordingStatus: 'retained', reportReplayed: false,
+      actionId, bundleId, sequence });
+  }, [{ id: 'redact', version: guardVersion, kind: 'sanitize', process: value => value + '!' }]);
+  const result = await sdk.enforce(operation(), { text: 'input' }, argumentsValue => {
+    assert.equal(argumentsValue.text, 'input!'); effects++; return { text: 'output' };
+  });
+  assert.equal(result.result.text, 'output!');
+  assert.deepEqual(attempts, { tool_call: 2, tool_result: 2 });
+  assert.equal(effects, 1);
+});
+
+test('generic conflicts and repeated renewal never authorize another preparation loop', async () => {
+  for (const code of ['unrelated_conflict', 'configuration_changed']) {
+    let checks = 0, effects = 0;
+    const sdk = enforceClient(async () => {
+      checks++; return Response.json({ code }, { status: 409 });
+    });
+    await assert.rejects(sdk.enforce(operation(), { amount: 1 }, () => { effects++; return {}; }), EnforceBlockedError);
+    assert.equal(checks, code === 'configuration_changed' ? 2 : 1);
+    assert.equal(effects, 0);
+  }
+});
+
+test('stale durable approvals refresh the original intent into a new exact review without executing', async () => {
+  let initialRequest = '', refreshRequest = '', effects = 0;
+  const approval = randomUUID();
+  const sdk = enforceClient(async (url, init) => {
+    const path = new URL(String(url)).pathname;
+    const body = JSON.parse(String(init?.body)) as RequestBody & { approvalRequestId: string; actionId: string; inputSha256: string; keySha256: string; proof: { issuedAt: number; expiresAt: number; signature: string } };
+    if (path === '/approval-permits/status') {
+      const statement = JSON.stringify({ type: 'authrail.approval.status.v1', organisationId, deploymentId,
+        approvalRequestId: body.approvalRequestId, actionId: body.actionId, inputSha256: body.inputSha256,
+        keySha256: body.keySha256, issuedAt: body.proof.issuedAt, expiresAt: body.proof.expiresAt });
+      assert.equal(verify(null, Buffer.from(statement), keys.publicKey, Buffer.from(body.proof.signature, 'base64url')), true);
+      return Response.json({ actionId, approvalRequestId: approval, state: 'permit_issued',
+        requiresRefresh: true, expiresAt: new Date(Date.now() - 60_000).toISOString() });
+    }
+    assert.equal(path, '/evaluate');
+    if (!initialRequest) initialRequest = body.requestId; else refreshRequest = body.requestId;
+    assert.deepEqual(body.arguments, { amount: 80 });
+    return Response.json({ requestId: body.requestId, mode: 'enforce', enforced: false,
+      coverage: 'evaluated', outcome: 'approval_required', actionId, approvalRequestId: initialRequest === body.requestId ? approval : randomUUID(), recordingStatus: 'retained', reportReplayed: false });
+  });
+  let waiting: EnforceBlockedError | undefined;
+  try { await sdk.enforce(operation(), { amount: 80 }, () => { effects++; return {}; }); }
+  catch (error) { assert.ok(error instanceof EnforceBlockedError); waiting = error; }
+  assert.ok(waiting?.approvalContinuation);
+  const status = await sdk.approvalStatus(waiting.approvalContinuation);
+  assert.equal(status.state, 'permit_issued'); assert.equal(status.requiresRefresh, true);
+  await assert.rejects(sdk.refreshApprovalFrom(waiting.approvalContinuation, () => { effects++; return {}; }), error => {
+    assert.ok(error instanceof EnforceBlockedError && error.approvalContinuation);
+    assert.equal(error.approvalContinuation.call.actionKey, operation().actionKey);
+    assert.notEqual(error.approvalContinuation.decision.approvalRequestId, approval);
+    return true;
+  });
+  assert.notEqual(refreshRequest, initialRequest); assert.equal(effects, 0);
+});
+
+test('reconciliation signs bounded opaque provider references while rejecting controls and oversized bytes', async () => {
+  let delivered = 0;
+  const sdk = client(async (_url, init) => { delivered++; return receiptResponse(init); });
+  const context = { actionId, attemptId: randomUUID(), permitId: null, inputSha256: 'a'.repeat(64), providerIdempotencyKey: `ar-${actionId}`, event: 'reconciled_succeeded' as const };
+  for (const providerReference of ['projects/acme/jobs/1?x=a&b=<value>', 'é'.repeat(2000)]) {
+    await sdk.reportExecution({ ...context, providerReference });
+  }
+  for (const providerReference of [' bad', 'bad\nref', 'bad\u007fref', 'é'.repeat(2001)]) {
+    await assert.rejects(sdk.reportExecution({ ...context, providerReference }));
+  }
+  assert.equal(delivered, 2);
 });

@@ -41,7 +41,7 @@ function signature(statement: object, proof: Proof) {
 }
 
 function harness(options: { wrongResource?: boolean; wrongAccount?: boolean; missingBinding?: boolean;
-  approval?: boolean; drift?: boolean; stripe?: boolean } = {}) {
+  approval?: boolean; drift?: boolean; stripe?: boolean; stale?: boolean } = {}) {
   let readerCalls = 0;
   let initialDigest = '';
   const evaluations: EvaluationBody[] = [];
@@ -107,6 +107,7 @@ function harness(options: { wrongResource?: boolean; wrongAccount?: boolean; mis
           ...(options.approval ? { approvalRequestId } : {}),
           bundleId: options.drift ? randomUUID() : bundleId, sequence: 1 }));
       }
+      if (url.pathname === '/approval-permits/status') return Response.json({ actionId, approvalRequestId, state: 'pending', requiresRefresh: true, expiresAt: new Date(Date.now()-60000).toISOString() });
       if (url.pathname === '/approval-permits/claim') {
         const body = JSON.parse(String(init?.body)) as ClaimBody;
         assert.equal(body.inputSha256, initialDigest, 'claim preserves original checked facts');
@@ -219,4 +220,24 @@ test('completed Data reads snapshot application-owned values before waiting for 
     bindings, { ...operation, requestId: randomUUID(), arguments: { invoiceId: 'invoice-1' } }, 'tool_call');
   assert.equal(shared.balance, 999);
   assert.equal(resolved.resolutions?.[0]?.value?.balance, 80, 'completed fact retains its original validated value');
+});
+
+
+test('explicit stale approval refresh rereads automatic facts without treating old generated facts as manual input', async () => {
+  const h = harness({ approval: true });
+  let saved: ApprovalContinuation | undefined;
+  try { await h.create().enforce(operation, h.args, () => { throw new Error('Waiting work executed'); }); }
+  catch (error) { assert.ok(error instanceof EnforceBlockedError); saved = error.approvalContinuation; }
+  assert.ok(saved);
+  const originalRequest = saved.call.requestId;
+  await assert.rejects(h.create().refreshApprovalFrom(saved, () => { throw new Error('Old votes executed'); }), error => {
+    assert.ok(error instanceof EnforceBlockedError && error.approvalContinuation);
+    assert.notEqual(error.approvalContinuation.call.requestId, originalRequest);
+    return true;
+  });
+  assert.equal(h.readCount(), 2);
+  assert.deepEqual(h.evaluations[0]!.factResolutions?.[0]?.value, { balance: 80 });
+  assert.deepEqual(h.evaluations[1]!.factResolutions?.[0]?.value, { balance: 60 });
+  assert.deepEqual(h.events, []);
+  assert.deepEqual(h.failures, []);
 });

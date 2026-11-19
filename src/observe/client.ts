@@ -1,7 +1,8 @@
 import { registeredDataSources, resolveData, type DataSourceBinding } from './data.js';
 import { createHash, createPrivateKey, createPublicKey, KeyObject, randomUUID, sign } from 'node:crypto';
-import type { ObservedCall, Phase } from './protocol.js';
+import type { ObservedCall, Phase, ExpectedBundle } from './protocol.js';
 import {
+  ConfigurationChangedError,
   boundedJSON,
   encodeAttribution,
   encodeInput,
@@ -22,10 +23,17 @@ import type {
   ObservedExecutionRecording,
 } from './types.js';
 
+export type ApprovalStatus = { actionId: string; approvalRequestId: string;
+  state: 'pending' | 'approved' | 'rejected' | 'cancelled' | 'expired' | 'consumed' | 'superseded' | 'permit_issued';
+  requiresRefresh: boolean; expiresAt: string };
+
 type Checked = { decision: ObserveDecision | null; error: unknown };
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const reference = /^[A-Za-z0-9._:-]{1,128}$/;
+function validProviderReference(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 4000 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) && Buffer.from(value).toString('utf8') === value;
+}
 const outcomes = new Set([
   'allow',
   'deny',
@@ -51,7 +59,7 @@ export class ObserveClient {
   constructor(config: ObserveClientConfig) {
     const url = new URL(config.sidecarUrl);
     if (
-      url.protocol !== 'http:' ||
+      !['http:', 'https:'].includes(url.protocol) ||
       !['127.0.0.1', '[::1]'].includes(url.hostname) ||
       url.username ||
       url.password ||
@@ -212,13 +220,15 @@ export class ObserveClient {
 
   /** Signs one phase; callers enforcing a decision must apply the outcome themselves. */
   async evaluate(call: ObservedCall, phase: Phase, expectedMode: 'observe' | 'enforce',
-    result?: unknown): Promise<ObserveDecision> {
+    result?: unknown, expectedBundle?: ExpectedBundle, refreshRetainedFacts = false): Promise<ObserveDecision> {
     const originalCall = call;
     const data = this.#dataSources !== undefined
-      ? await resolveData(this.#contextual, this.#dataSources, call, phase)
+      ? await resolveData(this.#contextual, this.#dataSources, call, phase, refreshRetainedFacts)
       : { resolutions: call.factResolutions, bundleId: undefined, sequence: undefined };
     call = { ...call, ...(data.resolutions ? { factResolutions: data.resolutions } : {}) };
-    const contextualFindings = await readContextual(this.#contextual, call, phase, result);
+    if (expectedBundle && data.bundleId && (expectedBundle.bundleId !== data.bundleId || expectedBundle.sequence !== data.sequence)) throw new ConfigurationChangedError();
+    expectedBundle ??= data.bundleId ? { bundleId: data.bundleId, sequence: data.sequence! } : undefined;
+    const contextualFindings = await readContextual(this.#contextual, call, phase, result, expectedBundle);
     const attribution = {
       principalId: call.principalId,
       sessionId: call.sessionId,
@@ -255,6 +265,7 @@ export class ObserveClient {
     const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
     const body = {
       formatVersion: 1,
+      ...(expectedBundle ? { expectedBundle } : {}),
       requestId: call.requestId,
       operationVersionId: call.operationVersionId,
       phase,
@@ -286,6 +297,10 @@ export class ObserveClient {
       // Leave room for the sidecar's bounded recording window; Observe stays short.
       signal: AbortSignal.timeout(expectedMode === 'enforce' ? 10000 : 2000),
     });
+    if (response.status === 409) {
+      const conflict = await boundedJSON(response);
+      if (jsonObject(conflict) && Object.keys(conflict).length === 1 && conflict.code === 'configuration_changed') throw new ConfigurationChangedError();
+    }
     if (response.status !== 200) throw new Error(`Sidecar returned HTTP ${response.status}`);
     const decision = await boundedJSON(response);
     if (
@@ -330,8 +345,7 @@ export class ObserveClient {
     return this.#approvalPermit(call, decision, true);
   }
 
-  async #approvalPermit(call: ObservedCall, decision: ObserveDecision,
-    recoverExisting: boolean): Promise<{ permitId: string; actionId: string; expiresAt: string }> {
+  async #approvalRequest(call: ObservedCall, decision: ObserveDecision, operation: 'claim' | 'recover' | 'status'): Promise<unknown> {
     if (decision.mode !== 'enforce' || decision.outcome !== 'approval_required' ||
       decision.recordingStatus !== 'retained' || decision.reportReplayed !== false ||
       !decision.actionId || !uuid.test(decision.actionId) ||
@@ -346,7 +360,7 @@ export class ObserveClient {
     const issuedAt = Math.floor(Date.now() / 1000);
     const expiresAt = issuedAt + 30;
     const statement = fields([
-      ['type', goJSON('authrail.approval.claim.v1')],
+      ['type', goJSON(operation === 'status' ? 'authrail.approval.status.v1' : 'authrail.approval.claim.v1')],
       ['organisationId', goJSON(this.#organisationId)],
       ['deploymentId', goJSON(this.#deploymentId)],
       ['approvalRequestId', goJSON(decision.approvalRequestId)],
@@ -357,8 +371,7 @@ export class ObserveClient {
       ['expiresAt', goJSON(expiresAt)],
     ]);
     const signature = sign(null, Buffer.from(statement), this.#privateKey).toString('base64url');
-    const response = await this.#fetch(new URL(recoverExisting
-      ? '/approval-permits/recover' : '/approval-permits/claim', this.#endpoint), {
+    const response = await this.#fetch(new URL(`/approval-permits/${operation}`, this.#endpoint), {
       method: 'POST', redirect: 'manual',
       headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json',
         ...(call.traceparent ? { traceparent: call.traceparent } : {}) },
@@ -367,10 +380,23 @@ export class ObserveClient {
         proof: { issuedAt, expiresAt, signature } }),
       signal: AbortSignal.timeout(3000),
     });
-    if (response.status !== (recoverExisting ? 200 : 201)) {
+    if (response.status !== (operation === 'claim' ? 201 : 200)) {
       throw new Error(`Approval permit returned HTTP ${response.status}`);
     }
-    const permit = await boundedJSON(response);
+    return boundedJSON(response);
+  }
+
+  /** Durable waiting state is independent of short-lived review freshness. */
+  async approvalStatus(call: ObservedCall, decision: ObserveDecision): Promise<ApprovalStatus> {
+    const value = await this.#approvalRequest(call, decision, 'status');
+    if (!jsonObject(value) || Object.keys(value).length !== 5 || value.actionId !== decision.actionId || value.approvalRequestId !== decision.approvalRequestId ||
+      !['pending','approved','rejected','cancelled','expired','consumed','superseded','permit_issued'].includes(String(value.state)) ||
+      typeof value.requiresRefresh !== 'boolean' || typeof value.expiresAt !== 'string' || !Number.isFinite(Date.parse(value.expiresAt))) throw new Error('Approval status response is invalid');
+    return value as ApprovalStatus;
+  }
+
+  async #approvalPermit(call: ObservedCall, decision: ObserveDecision, recoverExisting: boolean): Promise<{ permitId: string; actionId: string; expiresAt: string }> {
+    const permit = await this.#approvalRequest(call, decision, recoverExisting ? 'recover' : 'claim');
     if (!permit || typeof permit !== 'object' || Array.isArray(permit) ||
       !('permitId' in permit) || typeof permit.permitId !== 'string' ||
       !uuid.test(permit.permitId) || !('actionId' in permit) ||
@@ -388,7 +414,7 @@ export class ObserveClient {
     if (!uuid.test(call.requestId) || !uuid.test(call.operationVersionId) || !reference.test(call.actionKey) ||
       !['succeeded', 'failed', 'unknown', 'reconciled_succeeded', 'reconciled_failed'].includes(outcome.event) ||
       typeof outcome.providerIdempotencyKey !== 'string' || !reference.test(outcome.providerIdempotencyKey) ||
-      (outcome.providerReference !== null && (typeof outcome.providerReference !== 'string' || !reference.test(outcome.providerReference))) ||
+      (outcome.providerReference !== null && !validProviderReference(outcome.providerReference)) ||
       (outcome.event.startsWith('reconciled_') && outcome.providerReference === null)) {
       throw new Error('Observed execution outcome is invalid');
     }
@@ -438,6 +464,11 @@ export class ObserveClient {
     providerIdempotencyKey: string; providerReference: string | null;
     traceparent?: string }): Promise<{
       receiptId: string; state: string; replayed: boolean }> {
+    if (!uuid.test(input.actionId) || !uuid.test(input.attemptId) || (input.permitId !== null && !uuid.test(input.permitId)) ||
+      !/^[0-9a-f]{64}$/.test(input.inputSha256) || !reference.test(input.providerIdempotencyKey) ||
+      !['started','succeeded','failed','unknown','reconciled_succeeded','reconciled_failed'].includes(input.event) ||
+      (input.providerReference !== null && !validProviderReference(input.providerReference)) ||
+      (input.event === 'started' && input.providerReference !== null) || (input.event.startsWith('reconciled_') && input.providerReference === null)) throw new Error('Execution evidence is invalid');
     const publicKey = createPublicKey(this.#privateKey).export({ format: 'jwk' });
     if (typeof publicKey.x !== 'string') throw new Error('Executor key is invalid');
     const keySha256 = createHash('sha256').update(Buffer.from(publicKey.x, 'base64url')).digest('hex');

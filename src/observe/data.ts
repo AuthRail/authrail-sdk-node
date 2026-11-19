@@ -78,7 +78,7 @@ function parseSource(value: unknown): Source {
 
 /** Fetch reviewed reads before signing each phase; never mutate a saved call or continuation. */
 export async function resolveData(connection: { sidecarUrl: string; adapterToken: string; fetch: typeof globalThis.fetch },
-  bindings: DataSourceBinding[] | undefined, call: ObservedCall, phase: Phase): Promise<{
+  bindings: DataSourceBinding[] | undefined, call: ObservedCall, phase: Phase, refreshRetained = false): Promise<{
     resolutions: FactResolution[] | undefined; bundleId?: string; sequence?: number }> {
   if (bindings === undefined) return { resolutions: call.factResolutions };
   const endpoint = new URL('/data-requirements', connection.sidecarUrl);
@@ -96,7 +96,7 @@ export async function resolveData(connection: { sidecarUrl: string; adapterToken
   const sources = plan.requirements.map(parseSource);
   const ids = new Set<string>();
   for (const source of sources) { if (ids.has(source.sourceVersionId)) invalid(); ids.add(source.sourceVersionId); }
-  const manual = call.factResolutions ?? [];
+  const manual = (call.factResolutions ?? []).filter(fact => !(refreshRetained && ids.has(fact.sourceVersionId)));
   const manualIds = new Set<string>();
   for (const fact of manual) {
     if ((phase === 'tool_call' && ids.has(fact.sourceVersionId)) || manualIds.has(fact.sourceVersionId)) invalid();

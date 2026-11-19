@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, sign, type KeyObject } from 'node:crypto';
-import { boundedJSON, encodeAttribution, encodeInput, fields, goJSON, jsonObject, type ObservedCall, type Phase } from './protocol.js';
+import { ConfigurationChangedError, boundedJSON, encodeAttribution, encodeInput, fields, goJSON, jsonObject, type ObservedCall, type Phase, type ExpectedBundle } from './protocol.js';
 
 export type ContextualFinding = { payload: string; keyId: string; algorithm: 'ECDSA_SHA_256'; signature: string };
 export type ContextualConnection = { sidecarUrl: string; adapterToken: string;
@@ -10,7 +10,7 @@ const forbidden = new Set(['__proto__', 'prototype', 'constructor']);
 
 /** Obtains AuthRail findings for signed Rail requirements; model operation stays inside AuthRail. */
 export async function readContextual(connection: ContextualConnection, call: ObservedCall,
-  phase: Phase, result: unknown): Promise<ContextualFinding[]> {
+  phase: Phase, result: unknown, expectedBundle?: ExpectedBundle): Promise<ContextualFinding[]> {
   const planURL = new URL('/contextual-requirements', connection.sidecarUrl);
   planURL.searchParams.set('operationVersionId', call.operationVersionId);
   planURL.searchParams.set('phase', phase);
@@ -30,6 +30,7 @@ export async function readContextual(connection: ContextualConnection, call: Obs
   if (plan.coverage !== 'evaluated' || typeof plan.bundleId !== 'string' || !uuid.test(plan.bundleId)) {
     throw new Error('Contextual requirements are invalid');
   }
+  if (expectedBundle && (plan.bundleId !== expectedBundle.bundleId || plan.sequence !== expectedBundle.sequence)) throw new ConfigurationChangedError();
   const findings: ContextualFinding[] = [];
   if (plan.disclosureProcessing === true && !processedDisclosure(plan, call, phase, result)) return findings;
   const inputSha256 = createHash('sha256').update(encodeInput(call, phase, result)).digest('hex');

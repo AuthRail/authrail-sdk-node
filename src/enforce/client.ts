@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { ObserveClient } from '../observe/client.js';
 import type { ObservedCall } from '../observe/protocol.js';
-import { encodeInput, freezeContext, goJSON, jsonObject } from '../observe/protocol.js';
+import { ConfigurationChangedError, encodeInput, freezeContext, goJSON, jsonObject } from '../observe/protocol.js';
 import { processGuard, registeredHandlers } from './guard.js';
-import type { GuardHandler, JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
+import type { FactResolution, TrajectorySnapshot, GuardHandler, JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
 
 /** A blocked Enforce check. A result-phase block cannot undo an earlier tool effect. */
 export class EnforceBlockedError extends Error {
@@ -24,6 +24,8 @@ export class EnforceBlockedError extends Error {
 export type ApprovalContinuation = {
   call: ObservedCall;
   decision: ObserveDecision;
+  /** Original private input permits fresh processing without transforming twice. */
+  originalArguments?: JSONObject;
 };
 
 /** Execution ownership or its external outcome is uncertain; never retry the effect blindly. */
@@ -42,7 +44,7 @@ export class EnforceClient {
   readonly #sidecar: ObserveClient;
   readonly #handlers: Map<string, GuardHandler>;
   readonly #pending = new WeakMap<EnforceBlockedError,
-    { call: ObservedCall; decision: ObserveDecision;
+    { call: ObservedCall; decision: ObserveDecision; originalArguments: JSONObject;
       execute: (checkedArguments: JSONObject, context: ExecutionContext) => JSONObject | Promise<JSONObject> }>();
 
   constructor(config: ObserveClientConfig) {
@@ -61,32 +63,24 @@ export class EnforceClient {
     let call;
     try { call = this.#sidecar.prepare(operation, argumentsValue); }
     catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
+    const originalArguments = freezeContext(call.arguments);
     let callDecision: ObserveDecision;
-    try {
-      const processed = await processGuard(
-        await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_call', call.traceparent),
-        call.operationVersionId, 'tool_call', call.arguments, this.#handlers);
-      call = { ...call, arguments: processed.output, guardEvidence: processed.evidence };
-      callDecision = await this.#sidecar.evaluate(call, 'tool_call', 'enforce');
-      call = this.#sidecar.checkedCall(call);
-      if (callDecision.bundleId !== processed.bundleId || callDecision.sequence !== processed.sequence) {
-        throw new Error('Guard bundle changed');
-      }
-    } catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
+    try { ({ call, decision: callDecision } = await this.#checkCall(call, originalArguments)); }
+    catch (cause) { throw new EnforceBlockedError('tool_call', false, null, cause); }
     if (!permitted(callDecision)) {
       const continuable = callDecision.outcome === 'approval_required' &&
         callDecision.recordingStatus === 'retained' &&
         callDecision.reportReplayed === false && !!callDecision.approvalRequestId &&
         !!callDecision.actionId;
       const blocked = new EnforceBlockedError('tool_call', false, callDecision, undefined,
-        continuable ? { call, decision: callDecision } : undefined);
+        continuable ? { call, decision: callDecision, originalArguments } : undefined);
       if (continuable) {
-        this.#pending.set(blocked, { call, decision: callDecision, execute });
+        this.#pending.set(blocked, { call, decision: callDecision, execute, originalArguments });
       }
       throw blocked;
     }
 
-    const { result, resultDecision } = await this.#execute(call, execute, callDecision, null, checkpoint);
+    const { result, resultDecision } = await this.#execute(call, execute, callDecision, null, checkpoint, originalArguments);
     return { result, callDecision, resultDecision };
   }
 
@@ -108,7 +102,7 @@ export class EnforceClient {
       throw new EnforceBlockedError('tool_call', false, pending.decision);
     }
     const { result, resultDecision } = await this.#execute(
-      pending.call, pending.execute, pending.decision, permit.permitId, checkpoint);
+      pending.call, pending.execute, pending.decision, permit.permitId, checkpoint, pending.originalArguments);
     return { result, permitId: permit.permitId, resultDecision };
   }
 
@@ -130,7 +124,7 @@ export class EnforceClient {
     if (Date.parse(permit.expiresAt) <= Date.now()) {
       throw new EnforceBlockedError('tool_call', false, decision);
     }
-    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId, checkpoint);
+    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId, checkpoint, continuation.originalArguments);
     return { result, permitId: permit.permitId, resultDecision };
   }
 
@@ -152,8 +146,46 @@ export class EnforceClient {
     if (Date.parse(permit.expiresAt) <= Date.now()) {
       throw new EnforceBlockedError('tool_call', false, decision);
     }
-    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId, checkpoint);
+    const { result, resultDecision } = await this.#execute(call, execute, decision, permit.permitId, checkpoint, continuation.originalArguments);
     return { result, permitId: permit.permitId, resultDecision };
+  }
+
+  async approvalStatus(continuation: ApprovalContinuation) {
+    return this.#sidecar.approvalStatus(continuation.call, continuation.decision);
+  }
+
+  /** Explicit fresh review; prior votes and an unknown effect never become new permission. */
+  async refreshApprovalFrom<Result extends JSONObject>(continuation: ApprovalContinuation,
+    execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
+    options?: RefreshApprovalOptions): Promise<{ result: Result; callDecision: ObserveDecision; resultDecision: ObserveDecision }> {
+    const status = await this.approvalStatus(continuation);
+    if (!status.requiresRefresh || !['pending','approved','permit_issued'].includes(status.state)) throw new EnforceBlockedError('tool_call', false, continuation.decision);
+    if (!continuation.originalArguments && continuation.call.guardEvidence?.length) throw new Error('Original input is required for fresh Guard processing');
+    const originalArguments = freezeContext(continuation.originalArguments ?? continuation.call.arguments);
+    const fresh = { ...continuation.call, requestId: randomUUID(),
+      ...(options?.factResolutions ? { factResolutions: freezeContext({ facts: options.factResolutions }).facts as FactResolution[] } : {}),
+      ...(options?.trajectory ? { trajectory: freezeContext(options.trajectory) } : {}) };
+    const { call, decision } = await this.#checkCall(fresh, originalArguments, continuation.call.arguments);
+    if (goJSON(call.arguments) !== goJSON(continuation.call.arguments)) throw new EnforceBlockedError('tool_call', false, decision, new Error('Fresh processing changed the business input'));
+    if (!permitted(decision)) throw new EnforceBlockedError('tool_call', false, decision, undefined,
+      decision.outcome === 'approval_required' && decision.recordingStatus === 'retained' && decision.reportReplayed === false
+        ? { call, decision, originalArguments } : undefined);
+    const { result, resultDecision } = await this.#execute(call, execute, decision, null, options?.executionCheckpoint, originalArguments);
+    return { result, callDecision: decision, resultDecision };
+  }
+
+  async #checkCall(base: ObservedCall, originalArguments: JSONObject, expectedArguments?: JSONObject) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const processed = await processGuard(await this.#sidecar.guardRequirements(base.operationVersionId, 'tool_call', base.traceparent), base.operationVersionId, 'tool_call', originalArguments, this.#handlers);
+        if (expectedArguments && goJSON(processed.output) !== goJSON(expectedArguments)) throw new Error('Fresh processing changed the business input');
+        const prepared = { ...base, arguments: processed.output, guardEvidence: processed.evidence };
+        const decision = await this.#sidecar.evaluate(prepared, 'tool_call', 'enforce', undefined, { bundleId: processed.bundleId, sequence: processed.sequence }, expectedArguments !== undefined);
+        const call = this.#sidecar.checkedCall(prepared);
+        if (decision.bundleId !== processed.bundleId || decision.sequence !== processed.sequence) throw new Error('Guard bundle changed after evaluation');
+        return { call, decision };
+      } catch (cause) { if (attempt === 0 && cause instanceof ConfigurationChangedError) continue; throw cause; }
+    }
   }
 
   /** Resolves an uncertain attempt only after the executor has checked the provider by idempotency key. */
@@ -170,7 +202,7 @@ export class EnforceClient {
 
   async #execute<Result extends JSONObject>(call: ObservedCall,
     execute: (checkedArguments: JSONObject, context: ExecutionContext) => Result | Promise<Result>,
-    decision: ObserveDecision, permitId: string | null, checkpoint?: ExecutionCheckpoint) {
+    decision: ObserveDecision, permitId: string | null, checkpoint?: ExecutionCheckpoint, originalArguments?: JSONObject) {
     if (!decision.actionId) throw new EnforceBlockedError('tool_call', false, decision);
     const recovery = { actionId: decision.actionId, attemptId: call.requestId, permitId,
       inputSha256: createHash('sha256').update(encodeInput(call, 'tool_call')).digest('hex'),
@@ -212,17 +244,25 @@ export class EnforceClient {
         new Error('Tool result is not a bounded JSON object'));
     }
     let resultDecision: ObserveDecision;
+    const rawResult = freezeContext(result);
     try {
-      const processed = await processGuard(
-        await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_result', call.traceparent),
-        call.operationVersionId, 'tool_result', result, this.#handlers);
-      const guardEvidence = [...(call.guardEvidence ?? []), ...processed.evidence];
-      if (guardEvidence.length > 128) throw new Error('Guard processing evidence is too large');
-      const resultCall = { ...call, guardEvidence };
-      result = processed.output as Result;
-      resultDecision = await this.#sidecar.evaluate(resultCall, 'tool_result', 'enforce', result);
-      if (resultDecision.bundleId !== processed.bundleId || resultDecision.sequence !== processed.sequence) {
-        throw new Error('Guard bundle changed');
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const processed = await processGuard(await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_result', call.traceparent), call.operationVersionId, 'tool_result', rawResult, this.#handlers);
+          let preparedCall = call;
+          if (originalArguments && (processed.bundleId !== decision.bundleId || processed.sequence !== decision.sequence)) {
+            const freshCall = await processGuard(await this.#sidecar.guardRequirements(call.operationVersionId, 'tool_call', call.traceparent), call.operationVersionId, 'tool_call', originalArguments, this.#handlers);
+            if (freshCall.bundleId !== processed.bundleId || freshCall.sequence !== processed.sequence) throw new ConfigurationChangedError();
+            if (goJSON(freshCall.output) !== goJSON(call.arguments)) throw new Error('Current processing changed the executed business input');
+            preparedCall = { ...call, guardEvidence: freshCall.evidence };
+          }
+          const guardEvidence = [...(preparedCall.guardEvidence ?? []).filter(proof => proof.phase === 'tool_call'), ...processed.evidence];
+          if (guardEvidence.length > 128) throw new Error('Guard processing evidence is too large');
+          resultDecision = await this.#sidecar.evaluate({ ...preparedCall, guardEvidence }, 'tool_result', 'enforce', processed.output, { bundleId: processed.bundleId, sequence: processed.sequence });
+          if (resultDecision.bundleId !== processed.bundleId || resultDecision.sequence !== processed.sequence) throw new Error('Guard bundle changed after evaluation');
+          result = processed.output as Result;
+          break;
+        } catch (cause) { if (attempt === 0 && cause instanceof ConfigurationChangedError) continue; throw cause; }
       }
     } catch (cause) { throw new EnforceBlockedError('tool_result', true, null, cause); }
     if (!permittedResult(resultDecision, decision, permitId)) {
@@ -242,6 +282,8 @@ export type ExecutionCheckpoint = (context: Readonly<ExecutionContext>) => void 
 
 /** Per-invocation persistence; never changes other requests on the same client. */
 export type ExecutionOptions = { executionCheckpoint?: ExecutionCheckpoint };
+/** Explicit current manual context; automatic Data sources are reread during refresh. */
+export type RefreshApprovalOptions = ExecutionOptions & { factResolutions?: FactResolution[]; trajectory?: TrajectorySnapshot };
 
 function permitted(decision: ObserveDecision): boolean {
   return decision.mode === 'enforce' && decision.enforced === false &&

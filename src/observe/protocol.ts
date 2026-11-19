@@ -1,5 +1,11 @@
 import type { FactResolution, GuardEvidence, JSONObject, ObserveOperation, TrajectorySnapshot } from './types.js';
 
+export type ExpectedBundle = { bundleId: string; sequence: number };
+/** A preparation selected a different configuration before a decision was retained. */
+export class ConfigurationChangedError extends Error {
+  constructor() { super('Sidecar configuration changed before evaluation'); this.name = 'ConfigurationChangedError'; }
+}
+
 export type Phase = 'tool_call' | 'tool_result';
 export const MAX_EVALUATION_REQUEST_BYTES = 512 * 1024;
 export type ObservedCall = ObserveOperation & { arguments: JSONObject; requestId: string; guardEvidence?: GuardEvidence[] };

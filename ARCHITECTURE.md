@@ -63,3 +63,20 @@ SDK's string handlers.
 
 Protocol changes must stay language-neutral and preserve compatibility with
 the sidecar and server. Types alone do not establish wire compatibility.
+
+## Fresh preparation and durable waiting
+
+The customer application retains an exact checked call, private original arguments
+and a separate execution recovery identity. A denial-only `expectedBundle`
+selection is sent to the local sidecar. Only its typed pre-retention configuration
+conflict permits one fresh preparation from original input. It never permits
+repeating execution start or the business callback. Result preparation may retry
+under the same restriction after an effect, with exact executed-input comparison
+before refreshed contextual disclosure.
+
+Approval status separates durable state from freshness. Explicit refresh keeps
+business identity, replaces applicable automatic facts, uses a new attempt and
+retains a new exact review. Older votes and expired permits do not grant that
+new request. Standard claim/recovery remains bound to the original checked input.
+The matching sidecar source contract is required; released version compatibility
+is documented separately in the README.
