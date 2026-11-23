@@ -1,7 +1,7 @@
 import { lookupCustomerFact, lookupQuickBooksInvoiceBalance, lookupStripeInvoiceStatus,
   type CustomerRead } from '../facts.js';
-import type { ObservedCall, Phase } from './protocol.js';
-import { boundedJSON, jsonObject } from './protocol.js';
+import type { ObservedCall, Phase, ExpectedBundle } from './protocol.js';
+import { boundedJSON, jsonObject, ConfigurationChangedError } from './protocol.js';
 import type { FactResolution, JSONObject } from './types.js';
 
 /** Trusted application identity supplied to a once-bound resource resolver, never agent arguments. */
@@ -78,9 +78,9 @@ function parseSource(value: unknown): Source {
 
 /** Fetch reviewed reads before signing each phase; never mutate a saved call or continuation. */
 export async function resolveData(connection: { sidecarUrl: string; adapterToken: string; fetch: typeof globalThis.fetch },
-  bindings: DataSourceBinding[] | undefined, call: ObservedCall, phase: Phase, refreshRetained = false): Promise<{
-    resolutions: FactResolution[] | undefined; bundleId?: string; sequence?: number }> {
-  if (bindings === undefined) return { resolutions: call.factResolutions };
+  bindings: DataSourceBinding[] | undefined, call: ObservedCall, phase: Phase, refreshRetained = false, expectedBundle?: ExpectedBundle): Promise<{
+    resolutions: FactResolution[] | undefined; bundleId?: string; sequence?: number; hasManagedRequirements: boolean }> {
+  if (bindings === undefined) return { resolutions: call.factResolutions, hasManagedRequirements: false };
   const endpoint = new URL('/data-requirements', connection.sidecarUrl);
   endpoint.searchParams.set('operationVersionId', call.operationVersionId);
   endpoint.searchParams.set('phase', phase);
@@ -93,15 +93,21 @@ export async function resolveData(connection: { sidecarUrl: string; adapterToken
     plan.formatVersion !== 1 || plan.operationVersionId !== call.operationVersionId || plan.phase !== phase ||
     plan.coverage !== 'evaluated' || typeof plan.bundleId !== 'string' || !uuid.test(plan.bundleId) ||
     !Number.isSafeInteger(plan.sequence) || Number(plan.sequence) < 1 || !Array.isArray(plan.requirements) || plan.requirements.length > 32) invalid();
-  const sources = plan.requirements.map(parseSource);
+  if (expectedBundle && (plan.bundleId !== expectedBundle.bundleId || plan.sequence !== expectedBundle.sequence)) throw new ConfigurationChangedError();
+  const allSources = plan.requirements.map(parseSource);
   const ids = new Set<string>();
-  for (const source of sources) { if (ids.has(source.sourceVersionId)) invalid(); ids.add(source.sourceVersionId); }
-  const manual = (call.factResolutions ?? []).filter(fact => !(refreshRetained && ids.has(fact.sourceVersionId)));
+  for (const source of allSources) { if (ids.has(source.sourceVersionId)) invalid(); ids.add(source.sourceVersionId); }
+  const managedIds = new Set(allSources.filter(source => bindings.some(binding => binding.sourceVersionId === source.sourceVersionId)).map(source => source.sourceVersionId));
+  const manual = (call.factResolutions ?? []).filter(fact => !(refreshRetained && managedIds.has(fact.sourceVersionId)));
   const manualIds = new Set<string>();
   for (const fact of manual) {
-    if ((phase === 'tool_call' && ids.has(fact.sourceVersionId)) || manualIds.has(fact.sourceVersionId)) invalid();
+    if ((phase === 'tool_call' && managedIds.has(fact.sourceVersionId)) || manualIds.has(fact.sourceVersionId)) invalid();
     manualIds.add(fact.sourceVersionId);
   }
+  // Registered readers own only their current requirements. Caller-owned facts
+  // for other sources survive both initial preparation and the final refresh.
+  const sources = allSources.filter(source => managedIds.has(source.sourceVersionId) || !manualIds.has(source.sourceVersionId));
+  const resolvedIds = new Set(sources.map(source => source.sourceVersionId));
   const context: DataResourceContext = Object.freeze({ principalId: call.principalId,
     sessionId: call.sessionId, resourceId: call.resourceId ?? null, operationVersionId: call.operationVersionId });
   const deadline = AbortSignal.timeout(10000);
@@ -168,5 +174,5 @@ export async function resolveData(connection: { sidecarUrl: string; adapterToken
   let completed = false;
   try { completed = await Promise.race([workers.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 10000); })]); }
   finally { if (timer) clearTimeout(timer); }
-  return { resolutions: structuredClone([...manual.filter((fact) => !ids.has(fact.sourceVersionId)), ...(completed ? facts : sources.map(unavailable))]), bundleId: plan.bundleId, sequence: Number(plan.sequence) };
+  return { resolutions: structuredClone([...manual.filter((fact) => !resolvedIds.has(fact.sourceVersionId)), ...(completed ? facts : sources.map(unavailable))]), bundleId: plan.bundleId, sequence: Number(plan.sequence), hasManagedRequirements: managedIds.size > 0 };
 }

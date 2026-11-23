@@ -1267,3 +1267,33 @@ test('reconciliation signs bounded opaque provider references while rejecting co
   }
   assert.equal(delivered, 2);
 });
+
+test('trajectory lifecycle uses exact generations and never migrates legacy sessions implicitly', async () => {
+  const paths: string[] = [];
+  const sidecar = client(async (url, init) => {
+    assert.equal(init?.method, 'POST');
+    assert.equal(init?.redirect, 'manual');
+    assert.ok(init?.signal);
+    const path = new URL(String(url)).pathname;
+    paths.push(path);
+    const body = JSON.parse(String(init?.body));
+    if (path === '/trajectory/sessions') {
+      assert.deepEqual(body, { principalId: 'staff_123', sessionId: 'task_123' });
+      return Response.json({ ...body, generation: 7, nextSequence: 3 });
+    }
+    if (path === '/trajectory/sessions/retire') {
+      assert.deepEqual(body, { principalId: 'staff_123', sessionId: 'task_123', generation: 7 });
+      return new Response(null, { status: 204 });
+    }
+    assert.equal(path, '/trajectory/sessions/migrate-legacy');
+    assert.deepEqual(body, { disableLegacy: true });
+    return Response.json({ legacyDisabled: true, retiredLegacySessions: 2 });
+  });
+  const session = await sidecar.admitTrajectorySession('staff_123', 'task_123');
+  await sidecar.retireTrajectorySession(session);
+  assert.deepEqual(paths, ['/trajectory/sessions', '/trajectory/sessions/retire']);
+  assert.deepEqual(await sidecar.migrateLegacyTrajectorySessions(), { legacyDisabled: true, retiredLegacySessions: 2 });
+  const operationCall = sidecar.prepare({ ...operation(), trajectory: { sessionId: session.sessionId, generation: session.generation, sequence: session.nextSequence, complete: true, priorReadOperationVersionIds: [] } }, { amount: 50 });
+  assert.equal(encodeInput(operationCall, 'tool_call'), '{"arguments":{"amount":50},"trajectory":{"sessionId":"task_123","generation":7,"sequence":3,"complete":true,"priorReadOperationVersionIds":[]}}');
+  assert.throws(() => encodeInput({ ...operationCall, trajectory: { ...operationCall.trajectory!, sequence: 0 } }, 'tool_call'));
+});

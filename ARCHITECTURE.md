@@ -80,3 +80,30 @@ retains a new exact review. Older votes and expired permits do not grant that
 new request. Standard claim/recovery remains bound to the original checked input.
 The matching sidecar source contract is required; released version compatibility
 is documented separately in the README.
+
+When managed Data and Contextual AI are both active, preparation refreshes only
+current registered Data sources once after interpretation. A changed canonical
+input requires newly issued contextual findings for the same identity, selected
+material and pinned bundle. Caller-owned facts remain caller-owned. Evaluation,
+approval continuation and execution receipts bind the final detached snapshot;
+this refresh never repeats the business callback.
+
+## Managed session ownership
+
+Session admission, retirement and explicit legacy migration use the existing
+adapter-authenticated local listener. The sidecar owns monotonic generations,
+active hook sequences and atomic private-journal checkpoints. The SDK includes
+generation and sequence in the canonical input digest and reuses the frozen
+snapshot for the result. Completed reads compact into verified ordered history
+and the latest completed result replay fingerprint; older compacted sequences
+cannot become fresh calls. Applications coordinate concurrent preparation using
+the sidecar's durable next sequence.
+
+Retirement frees one exact active generation without acknowledging reports,
+resolving an uncertain effect or retrying a business callback. Explicit legacy
+migration disables the unversioned protocol before freeing its histories; it is
+never an automatic admission side effect. The journal belongs to one sidecar
+instance. Existing central Action/attempt and evidence owners retain recovery;
+these methods do not supply shared storage between replicas.
+
+Direct customer fact-reader and extraction helpers bound the caller’s wait by the reviewed timeout and discard late values/errors. Cancellation is delivered to the callback, but the application still owns its requests, handles and cleanup. JavaScript that blocks the event loop cannot be forcibly interrupted; isolate blocking callbacks when needed. Automatic Data deadlines remain a separate outer boundary. No callback failure or uncertain value retries a business write.

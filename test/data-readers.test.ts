@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, randomUUID, verify } from 'node:crypto';
 import { test } from 'node:test';
-import { EnforceBlockedError, EnforceClient } from '../src/index.js';
+import { EnforceBlockedError, EnforceClient, ObserveClient } from '../src/index.js';
 import type { ApprovalContinuation, DataSourceBinding, FactResolution, GuardEvidence,
   JSONObject, ObserveOperation } from '../src/index.js';
 import { encodeInput } from '../src/observe/protocol.js';
@@ -30,6 +30,7 @@ type EvaluationBody = { requestId: string; operationVersionId: string; phase: 't
   arguments: JSONObject; result?: JSONObject; factResolutions?: FactResolution[]; guardEvidence?: GuardEvidence[];
   attribution: Pick<ObserveOperation, 'principalId' | 'sessionId' | 'resourceId' | 'principalSource' | 'resourceSource'>;
   identityProof: Proof };
+type Reading = { phase: 'tool_call'|'tool_result'; requestId:string; bundleId:string; inputSha256:string; material:string; attributionSha256:string; proof:Proof };
 type ReceiptBody = { actionId: string; attemptId: string; permitId: string | null; event: string;
   inputSha256: string; providerIdempotencyKey: string; providerReference: string | null;
   keySha256: string; proof: Proof };
@@ -41,12 +42,15 @@ function signature(statement: object, proof: Proof) {
 }
 
 function harness(options: { wrongResource?: boolean; wrongAccount?: boolean; missingBinding?: boolean;
-  approval?: boolean; drift?: boolean; stripe?: boolean; stale?: boolean } = {}) {
+  approval?: boolean; drift?: boolean; stripe?: boolean; stale?: boolean; contextual?:boolean; rebindDrift?:boolean } = {}) {
   let readerCalls = 0;
   let initialDigest = '';
   const evaluations: EvaluationBody[] = [];
   const events: string[] = [];
   const failures: unknown[] = [];
+  const readings:Reading[]=[];
+  const contextualPlans={tool_call:0,tool_result:0};
+  const readingCounts={tool_call:0,tool_result:0};
   const binding: DataSourceBinding = options.stripe ? {
     sourceVersionId, kind: 'stripe', providerAccountId: 'acct_12345678', secretKey: 'private-test-key',
     resolveResource: (context) => { assert.equal(context.resourceId, 'invoice-1'); return 'in_1234'; },
@@ -72,12 +76,23 @@ function harness(options: { wrongResource?: boolean; wrongAccount?: boolean; mis
   };
   const sourceContract = options.stripe ? { formatVersion: 1, provider: 'stripe', lookup: 'invoice.retrieve',
     providerAccountId: 'acct_12345678', queryField: contract.queryField, factKey: 'status', resultField: 'status',
-    maxAgeSeconds: 60, timeoutMs: 1000, failure: 'unavailable' } : contract;
+    maxAgeSeconds: 60, timeoutMs: 1000, failure: 'unavailable' } : {...contract,maxAgeSeconds:options.contextual?1:60};
   const transport: typeof fetch = async (input, init) => {
     try {
       const url = new URL(String(input));
       assert.equal(new Headers(init?.headers).get('Authorization'), `Bearer ${adapterToken}`);
-      if (url.pathname === '/contextual-requirements') return new Response(null, { status: 404 });
+      if (url.pathname === '/contextual-requirements') {
+        if(!options.contextual)return new Response(null, { status: 404 });
+        const phase=url.searchParams.get('phase')==='tool_result'?'tool_result':'tool_call';
+        contextualPlans[phase]++;
+        return Response.json({formatVersion:1,operationVersionId,phase,bundleId,sequence:options.rebindDrift&&contextualPlans[phase]>1?2:1,coverage:'evaluated',requirements:[{railVersionId:sourceVersionId,assessment:{id:'invoice_review',phase,fields:[{root:'arguments',path:['invoiceId']}]}}]});
+      }
+      if(url.pathname==='/contextual-readings') {
+        const reading=JSON.parse(String(init?.body)) as Reading;
+        readings.push(reading);const count=++readingCounts[reading.phase];
+        if(count===1)await new Promise(resolve=>setTimeout(resolve,1100));
+        return Response.json({payload:reading.inputSha256,keyId:`finding-${count}`,algorithm:'ECDSA_SHA_256',signature:`server-signature-${count}`});
+      }
       if (url.pathname === '/guard-requirements' || url.pathname === '/data-requirements') {
         assert.equal(init?.method, 'GET');
         assert.equal(url.searchParams.get('operationVersionId'), operationVersionId);
@@ -97,6 +112,13 @@ function harness(options: { wrongResource?: boolean; wrongAccount?: boolean; mis
           issuedAt: body.identityProof.issuedAt, expiresAt: body.identityProof.expiresAt }, body.identityProof);
         assert.equal(body.factResolutions?.length, 1);
         assert.equal(body.factResolutions[0]!.sourceVersionId, sourceVersionId);
+        if(options.contextual){
+          const findings=(JSON.parse(String(init?.body)) as {contextualFindings:{payload:string;keyId:string;signature:string}[]}).contextualFindings;
+          assert.equal(findings[0]?.payload,inputSha256,'only the final exact input binding reaches evaluation');
+          assert.equal(findings[0]?.keyId,'finding-2');
+          assert.equal(findings[0]?.signature,'server-signature-2');
+          assert.ok(Date.now()-Date.parse(body.factResolutions[0]!.observedAt!)<1000,'managed data refreshed after the slow classification');
+        }
         evaluations.push(body);
         if (body.phase === 'tool_call') initialDigest = inputSha256;
         const status = body.factResolutions[0]!.status;
@@ -133,7 +155,7 @@ function harness(options: { wrongResource?: boolean; wrongAccount?: boolean; mis
   const create = () => new EnforceClient({ sidecarUrl: 'http://127.0.0.1:7078', adapterToken,
     organisationId, deploymentId, executorPrivateKey: keys.privateKey, fetch: transport,
     dataSources: options.missingBinding ? [] : [binding] });
-  return { create, evaluations, events, failures, readCount: () => readerCalls,
+  return { create, evaluations, events, failures, readings, readCount: () => readerCalls,
     args: { invoiceId: options.stripe ? 'in_1234' : 'invoice-1', amount: 50 } };
 }
 
@@ -240,4 +262,56 @@ test('explicit stale approval refresh rereads automatic facts without treating o
   assert.deepEqual(h.evaluations[1]!.factResolutions?.[0]?.value, { balance: 60 });
   assert.deepEqual(h.events, []);
   assert.deepEqual(h.failures, []);
+});
+
+test('slow contextual preparation refreshes managed call and result facts once and rebinds exact final digests',async()=>{
+  const h=harness({contextual:true});let effects=0;
+  await h.create().enforce(operation,h.args,()=>{effects++;return {done:true};});
+  assert.equal(effects,1);assert.equal(h.readCount(),4);
+  assert.equal(h.readings.length,4);assert.equal(h.evaluations.length,2);
+  for(const phase of ['tool_call','tool_result'] as const){
+    const reads=h.readings.filter(reading=>reading.phase===phase);
+    assert.equal(reads.length,2);assert.notEqual(reads[0]!.inputSha256,reads[1]!.inputSha256);
+    for(const field of ['requestId','material','attributionSha256','bundleId'] as const)assert.equal(reads[0]![field],reads[1]![field]);
+  }
+  assert.deepEqual(h.events,['started','succeeded']);assert.deepEqual(h.failures,[]);
+  assert.equal(h.evaluations[0]!.factResolutions?.[0]?.value?.balance,60);
+});
+
+test('changed bundle during contextual rebinding never discloses a second reading or retries the business callback',async()=>{
+  const h=harness({contextual:true,rebindDrift:true});let effects=0;
+  await assert.rejects(h.create().enforce(operation,h.args,()=>{effects++;return {done:true};}),EnforceBlockedError);
+  assert.equal(effects,0);assert.equal(h.readings.length,1);assert.equal(h.evaluations.length,0);
+  assert.deepEqual(h.events,[]);assert.deepEqual(h.failures,[]);
+});
+
+test('Data drift is rejected before trusted reads and unmanaged manual facts are retained',async()=>{
+  let lookups=0;
+  const binding:DataSourceBinding={sourceVersionId,kind:'sdk',sourceIdentity:'billing-service',accountBoundary:'account-1',lookup:'invoice.read',resolveResource:()=>{lookups++;return 'invoice-1';},read:async()=>{throw new Error('unexpected read');}};
+  const call:ObservedCall={...operation,requestId:randomUUID(),arguments:{invoiceId:'invoice-1'}};
+  const response=(sequence:number)=>Response.json({formatVersion:1,operationVersionId,phase:'tool_call',bundleId,sequence,coverage:'evaluated',requirements:[{sourceVersionId,contract}]});
+  await assert.rejects(resolveData({sidecarUrl:'http://127.0.0.1:7078',adapterToken,fetch:async()=>response(2)},[binding],call,'tool_call',true,{bundleId,sequence:1}),/configuration changed/i);
+  assert.equal(lookups,0);
+  const manual:FactResolution={sourceVersionId,lookup:'invoice.read',lookupKey:'invoice-1',sourceIdentity:'billing-service',accountBoundary:'account-1',authenticatedExecutor:true,status:'ok',observedAt:new Date().toISOString(),value:{balance:40}};
+  for(const refresh of [false,true]){
+    const resolved=await resolveData({sidecarUrl:'http://127.0.0.1:7078',adapterToken,fetch:async()=>response(1)},[],{...call,factResolutions:[manual]},'tool_call',refresh,{bundleId,sequence:1});
+    assert.equal(resolved.hasManagedRequirements,false);assert.deepEqual(resolved.resolutions,[manual]);
+  }
+});
+
+test('manual-only or no-current Data requirements never trigger a near-final automatic read',async()=>{
+  for(const configured of [false,true]){
+    let plans=0,readings=0,lookups=0;
+    const manual:FactResolution={sourceVersionId,lookup:'invoice.read',lookupKey:'invoice-1',sourceIdentity:'billing-service',accountBoundary:'account-1',authenticatedExecutor:true,status:'ok',observedAt:new Date().toISOString(),value:{balance:40}};
+    const sdk=new ObserveClient({sidecarUrl:'http://127.0.0.1:7078',adapterToken,organisationId,deploymentId,executorPrivateKey:keys.privateKey,
+      ...(configured?{dataSources:[{sourceVersionId,kind:'sdk' as const,sourceIdentity:'billing-service',accountBoundary:'account-1',lookup:'invoice.read',resolveResource:()=>{lookups++;return 'invoice-1';},read:async()=>{throw new Error('unexpected read');}}]}:{}),
+      fetch:async(url,init)=>{const path=new URL(String(url)).pathname;
+        if(path==='/data-requirements'){plans++;return Response.json({formatVersion:1,operationVersionId,phase:'tool_call',bundleId,sequence:1,coverage:'evaluated',requirements:[]});}
+        if(path==='/contextual-requirements')return Response.json({formatVersion:1,operationVersionId,phase:'tool_call',bundleId,sequence:1,coverage:'evaluated',requirements:[{railVersionId:sourceVersionId,assessment:{id:'invoice_review',phase:'tool_call',fields:[{root:'arguments',path:['invoiceId']}]}}]});
+        if(path==='/contextual-readings'){readings++;return Response.json({payload:'original-server-finding',keyId:'key',algorithm:'ECDSA_SHA_256',signature:'signed'});}
+        assert.equal(path,'/evaluate');const body=JSON.parse(String(init?.body));assert.deepEqual(body.factResolutions,[manual]);return Response.json({requestId:body.requestId,mode:'observe',enforced:false,coverage:'evaluated',outcome:'allow',...(configured?{bundleId,sequence:1}:{})});
+      }});
+    await sdk.evaluate(sdk.prepare({...operation,factResolutions:[manual]},{invoiceId:'invoice-1'}),'tool_call','observe');
+    assert.equal(plans,configured?1:0);assert.equal(readings,1);assert.equal(lookups,0);
+  }
 });

@@ -38,11 +38,16 @@ export type FactResolution = {
 /** Application-asserted session history; the sidecar checks it against its private ledger. */
 export type TrajectorySnapshot = {
   sessionId: string;
+  generation?: number;
+  sequence?: number;
   start?: boolean;
   complete: boolean;
   priorReadOperationVersionIds: string[];
   values?: JSONObject;
 };
+
+/** Sidecar-owned active session identity. Reuse the same sequence for call and result. */
+export type TrajectorySession = { principalId: string; sessionId: string; generation: number; nextSequence: number };
 
 /** Small, application-supplied context for named human reviewers. Never include secrets. */
 export type ReviewSummary = {

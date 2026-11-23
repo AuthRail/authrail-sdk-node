@@ -3,7 +3,7 @@ import { ObserveClient } from '../observe/client.js';
 import type { ObservedCall } from '../observe/protocol.js';
 import { ConfigurationChangedError, encodeInput, freezeContext, goJSON, jsonObject } from '../observe/protocol.js';
 import { processGuard, registeredHandlers } from './guard.js';
-import type { FactResolution, TrajectorySnapshot, GuardHandler, JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
+import type { FactResolution, TrajectorySnapshot, TrajectorySession, GuardHandler, JSONObject, ObserveClientConfig, ObserveDecision, ObserveOperation } from '../observe/types.js';
 
 /** A blocked Enforce check. A result-phase block cannot undo an earlier tool effect. */
 export class EnforceBlockedError extends Error {
@@ -50,6 +50,16 @@ export class EnforceClient {
   constructor(config: ObserveClientConfig) {
     this.#sidecar = new ObserveClient(config);
     this.#handlers = registeredHandlers(config.guardHandlers);
+  }
+
+  admitTrajectorySession(principalId: string, sessionId: string): Promise<TrajectorySession> {
+    return this.#sidecar.admitTrajectorySession(principalId, sessionId);
+  }
+  retireTrajectorySession(session: Pick<TrajectorySession, 'principalId' | 'sessionId' | 'generation'>): Promise<void> {
+    return this.#sidecar.retireTrajectorySession(session);
+  }
+  migrateLegacyTrajectorySessions(): Promise<{ legacyDisabled: true; retiredLegacySessions: number }> {
+    return this.#sidecar.migrateLegacyTrajectorySessions();
   }
 
   async enforce<Result extends JSONObject>(

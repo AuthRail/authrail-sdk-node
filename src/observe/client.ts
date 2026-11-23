@@ -21,6 +21,7 @@ import type {
   ObserveOperation,
   ObservedExecutionOutcome,
   ObservedExecutionRecording,
+  TrajectorySession,
 } from './types.js';
 
 export type ApprovalStatus = { actionId: string; approvalRequestId: string;
@@ -90,6 +91,38 @@ export class ObserveClient {
     this.#contextual = { sidecarUrl: url.origin, adapterToken: this.#token,
       organisationId: this.#organisationId, deploymentId: this.#deploymentId,
       executorPrivateKey: privateKey, fetch: this.#fetch };
+  }
+
+  /** Admit or inspect one active session; never creates a generation from caller input. */
+  async admitTrajectorySession(principalId: string, sessionId: string): Promise<TrajectorySession> {
+    if (!reference.test(principalId) || !reference.test(sessionId)) throw new Error('Trajectory identity is invalid');
+    const value = await this.#trajectoryRequest('/trajectory/sessions', { principalId, sessionId });
+    if (!jsonObject(value) || value.principalId !== principalId || value.sessionId !== sessionId ||
+      typeof value.generation !== 'number' || !Number.isSafeInteger(value.generation) || value.generation <= 0 ||
+      typeof value.nextSequence !== 'number' || !Number.isSafeInteger(value.nextSequence) || value.nextSequence <= 0) throw new Error('Trajectory admission response is invalid');
+    return { principalId, sessionId, generation: value.generation, nextSequence: value.nextSequence };
+  }
+
+  /** End an exact generation. Pending evidence and unknown business effects remain retained. */
+  async retireTrajectorySession(session: Pick<TrajectorySession, 'principalId' | 'sessionId' | 'generation'>): Promise<void> {
+    if (!reference.test(session.principalId) || !reference.test(session.sessionId) || !Number.isSafeInteger(session.generation) || session.generation <= 0) throw new Error('Trajectory retirement is invalid');
+    await this.#trajectoryRequest('/trajectory/sessions/retire', { principalId: session.principalId, sessionId: session.sessionId, generation: session.generation }, 204);
+  }
+
+  /** Explicitly disable legacy session admissions and retire their local histories. */
+  async migrateLegacyTrajectorySessions(): Promise<{ legacyDisabled: true; retiredLegacySessions: number }> {
+    const value = await this.#trajectoryRequest('/trajectory/sessions/migrate-legacy', { disableLegacy: true });
+    if (!jsonObject(value) || value.legacyDisabled !== true || typeof value.retiredLegacySessions !== 'number' ||
+      !Number.isSafeInteger(value.retiredLegacySessions) || value.retiredLegacySessions < 0 || value.retiredLegacySessions > 128) throw new Error('Trajectory migration response is invalid');
+    return { legacyDisabled: true, retiredLegacySessions: value.retiredLegacySessions };
+  }
+
+  async #trajectoryRequest(path: string, body: object, status = 200): Promise<unknown> {
+    const response = await this.#fetch(new URL(path, this.#endpoint), { method: 'POST', redirect: 'manual',
+      signal: AbortSignal.timeout(2000), headers: { Authorization: `Bearer ${this.#token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) });
+    if (response.status !== status) throw new Error(`Trajectory lifecycle returned HTTP ${response.status}`);
+    return status === 204 ? undefined : boundedJSON(response);
   }
 
   /** Runs the protected function independently of the checks; read observation for coverage gaps. */
@@ -222,13 +255,24 @@ export class ObserveClient {
   async evaluate(call: ObservedCall, phase: Phase, expectedMode: 'observe' | 'enforce',
     result?: unknown, expectedBundle?: ExpectedBundle, refreshRetainedFacts = false): Promise<ObserveDecision> {
     const originalCall = call;
-    const data = this.#dataSources !== undefined
-      ? await resolveData(this.#contextual, this.#dataSources, call, phase, refreshRetainedFacts)
-      : { resolutions: call.factResolutions, bundleId: undefined, sequence: undefined };
+    let data = this.#dataSources !== undefined
+      ? await resolveData(this.#contextual, this.#dataSources, call, phase, refreshRetainedFacts, expectedBundle)
+      : { resolutions: call.factResolutions, bundleId: undefined, sequence: undefined, hasManagedRequirements: false };
     call = { ...call, ...(data.resolutions ? { factResolutions: data.resolutions } : {}) };
     if (expectedBundle && data.bundleId && (expectedBundle.bundleId !== data.bundleId || expectedBundle.sequence !== data.sequence)) throw new ConfigurationChangedError();
     expectedBundle ??= data.bundleId ? { bundleId: data.bundleId, sequence: data.sequence! } : undefined;
-    const contextualFindings = await readContextual(this.#contextual, call, phase, result, expectedBundle);
+    const preparedInput = encodeInput(call, phase, result);
+    let contextualFindings = await readContextual(this.#contextual, call, phase, result, expectedBundle);
+    if (this.#dataSources !== undefined && data.hasManagedRequirements && contextualFindings.length) {
+      // Slow classifications must not age managed facts before authorization.
+      // Findings are requested again for a changed input; never cache or re-sign them here.
+      data = await resolveData(this.#contextual, this.#dataSources, call, phase, true, expectedBundle);
+      if (expectedBundle && (data.bundleId !== expectedBundle.bundleId || data.sequence !== expectedBundle.sequence)) throw new ConfigurationChangedError();
+      call = { ...call, ...(data.resolutions ? { factResolutions: data.resolutions } : {}) };
+      if (encodeInput(call, phase, result) !== preparedInput) {
+        contextualFindings = await readContextual(this.#contextual, call, phase, result, expectedBundle);
+      }
+    }
     const attribution = {
       principalId: call.principalId,
       sessionId: call.sessionId,

@@ -281,6 +281,30 @@ material and retain the assessment status and finding instead. The
 [Contextual AI guide](https://docs.authrail.io/docs/facts) explains this flow
 and its failure handling.
 
+## Managed session lifecycle in source
+
+`admitTrajectorySession(principalId, sessionId)` returns a sidecar-owned session generation and
+`nextSequence`. Put that generation and sequence in the trajectory snapshot
+for one exact call/result pair. Both fields are included in the signed input.
+Admission inspects an already-active identity, so a lost reply does not require
+inventing a generation. It does not reserve the next sequence: applications must
+coordinate concurrent preparation for the same session and re-admit to inspect
+its durable next sequence after interruption.
+
+`retireTrajectorySession(session)` ends only that exact generation. The same session
+name may then receive a newer generation; old hooks and stale retirement requests
+cannot close or reopen it. Completed read hooks compact into ordered verified
+history and the latest completed replay checkpoint. Older compacted sequences
+are denied. Keep outstanding business recovery with the existing Action/attempt
+records; retirement does not acknowledge queued evidence or resolve unknown effects.
+
+`migrateLegacyTrajectorySessions()` explicitly disables legacy session admission and
+retires legacy trajectory histories together. Ordinary admission/retirement never
+invokes migration automatically. Legacy examples below remain compatible until
+that deliberate deployment-local change. Sessions live in the owning sidecar's
+private journal; this is not shared replica state. These methods require matching
+source SDK/sidecar releases and are unavailable in older published artifacts.
+
 ## Trusted context and security
 
 Supply `factResolutions` from the configured Data source and protected reader,
@@ -495,6 +519,12 @@ returns the exact `configuration_changed` conflict. The SDK rebuilds preparation
 once from the original private input. A generic conflict, denied decision, network
 error or execution-start uncertainty never triggers this retry. This keeps an
 unchanged renewal from double-transforming input or repeating a business effect.
+
+When registered Data readers and Contextual AI apply together, the SDK rereads
+current managed facts once after interpretation. If the exact input changes, it
+requests new contextual findings before evaluation. It preserves manual facts
+for unregistered sources. The final checked snapshot also binds approval and
+execution records; this refresh does not retry your business callback.
 
 After a completed effect, the same bounded retry can repeat result preparation
 and checking only. If current argument processing is needed for contextual

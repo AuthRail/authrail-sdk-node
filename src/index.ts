@@ -16,6 +16,7 @@ export type {
   ObserveDecision,
   ObserveOperation,
   TrajectorySnapshot,
+  TrajectorySession,
 } from './observe/types.js';
 export { discover } from './discovery.js';
 export type { Discovery } from './discovery.js';

@@ -129,6 +129,25 @@ function validObservedAt(value: string): boolean {
   return Number.isFinite(millis) && millis <= Date.now() + 5000;
 }
 
+/** Bound the caller's wait, not the lifetime of application-owned callback resources. */
+function waitForFactCallback<T>(timeoutMs: number, callback: (signal: AbortSignal) => Promise<T>): Promise<T | undefined> {
+  const controller = new AbortController();
+  const deadline = performance.now() + timeoutMs;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value?: T) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (performance.now() >= deadline) { controller.abort(); resolve(undefined); }
+      else resolve(value);
+    };
+    const timer = setTimeout(() => { controller.abort(); finish(); }, timeoutMs);
+    // Both handlers remain attached to discard late values and consume late rejection.
+    void Promise.resolve().then(() => callback(controller.signal)).then(finish, () => finish());
+  });
+}
+
 /** Reads one reviewed customer source with a credential-owning application callback. */
 export async function lookupCustomerFact(source: CustomerSource, lookupKey: string,
   read: CustomerRead): Promise<FactResolution> {
@@ -139,11 +158,9 @@ export async function lookupCustomerFact(source: CustomerSource, lookupKey: stri
   const resolution: FactResolution = { sourceVersionId: source.sourceVersionId,
     sourceIdentity: source.sourceIdentity, accountBoundary: source.accountBoundary,
     lookup: source.lookup, lookupKey, authenticatedExecutor: true, status: 'unavailable' };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), source.timeoutMs);
   try {
-    const result = await read(lookupKey, controller.signal);
-    if (controller.signal.aborted) return resolution;
+    const result = await waitForFactCallback(source.timeoutMs, signal => read(lookupKey, signal));
+    if (!result) return resolution;
     if (result.sourceIdentity !== source.sourceIdentity ||
       result.accountBoundary !== source.accountBoundary || result.lookup !== source.lookup ||
       result.lookupKey !== lookupKey || !validObservedAt(result.observedAt) ||
@@ -151,7 +168,6 @@ export async function lookupCustomerFact(source: CustomerSource, lookupKey: stri
     return { ...resolution, status: 'ok', observedAt: new Date(result.observedAt).toISOString(),
       value: result.value };
   } catch { return resolution; }
-  finally { clearTimeout(timer); }
 }
 
 /** Builds a fixed HTTPS GET reader; bearer credentials stay in the protected application. */
@@ -226,13 +242,8 @@ export async function extractContextFact(source: ExtractionSource, lookupKey: st
   if (!(document instanceof Uint8Array) || !document.byteLength ||
     document.byteLength > source.maxInputBytes) return resolution;
   const copy = Uint8Array.from(document);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), source.timeoutMs);
-  let result: ExtractionResult;
-  try { result = await extractor(copy, controller.signal); }
-  catch { return resolution; }
-  finally { clearTimeout(timer); }
-  if (controller.signal.aborted) return resolution;
+  const result = await waitForFactCallback(source.timeoutMs, signal => extractor(copy, signal));
+  if (!result) return resolution;
   if (result.modelId !== source.modelId ||
     result.modelConfigSha256 !== source.modelConfigSha256 ||
     result.promptVersion !== source.promptVersion) return { ...resolution, status: 'untrusted' };

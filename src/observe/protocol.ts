@@ -102,6 +102,10 @@ function encodeFact(value: FactResolution): string {
 
 function encodeTrajectory(value: TrajectorySnapshot): string {
   const entries: Field[] = [['sessionId', goJSON(value.sessionId)]];
+  if ((value.generation === undefined) !== (value.sequence === undefined) ||
+    [value.generation, value.sequence].some((counter) => counter !== undefined && (!Number.isSafeInteger(counter) || counter <= 0))) throw new Error('Trajectory generation and sequence are invalid');
+  optional(entries, 'generation', value.generation);
+  optional(entries, 'sequence', value.sequence);
   if (value.start) entries.push(['start', 'true']);
   entries.push(
     ['complete', goJSON(value.complete)],
