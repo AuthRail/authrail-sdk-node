@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { EnforceBlockedError, EnforceClient } from '../dist/index.js';
+import { EnforceBlockedError, EnforceClient, EnforceOutcomeUnknownError } from '../dist/index.js';
 
 // Invoked by the Go SDK's isolated real-sidecar harness, with generated fixture
 // credentials on stdin. This never connects to a customer deployment or provider.
@@ -37,7 +37,9 @@ const resumed = await restarted.recoverApprovalFrom(stored, (input) => {
 });
 assert.equal(resumed.resultDecision.outcome, 'approval_required');
 await assert.rejects(restarted.recoverApprovalFrom(stored, () => { effects++; return {}; }),
-  (error) => error instanceof EnforceBlockedError && error.phase === 'tool_call');
+  (error) => error instanceof EnforceOutcomeUnknownError && error.effectMayHaveOccurred === true &&
+    error.recovery?.actionId === config.actionId && error.recovery?.attemptId === stored.call.requestId &&
+    error.recovery?.providerIdempotencyKey === `ar-${config.actionId}` && Boolean(error.recovery?.permitId));
 assert.equal(effects, 2);
 const nearLimitInput = { amount: 80, padding: '' };
 nearLimitInput.padding = 'x'.repeat(64 * 1024 - Buffer.byteLength(JSON.stringify(nearLimitInput)));
